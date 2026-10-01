@@ -1,0 +1,14 @@
+{
+  "nodeCategories": {
+    "Rui": "Rui",
+    "Rui/Image": "Image",
+    "Rui/Image/Load": "Load",
+    "Rui/Image/Save": "Save",
+    "Rui/Image/Preview": "Preview",
+    "Rui/Batch": "Batch",
+    "Rui/Flow": "Flow",
+    "Rui/Logic": "Logic",
+    "Rui/UI": "UI",
+    "Rui/Utilities": "Utilities"
+  }
+}

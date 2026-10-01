@@ -1,0 +1,8825 @@
+import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
+import { ruiT } from "./rui_i18n.js";
+import { pinyin as pinyinPro } from "./pinyin-pro.esm.js";
+window.pinyinPro = { pinyin: pinyinPro };
+
+const STORAGE_KEY = "comfyui_rui";
+const SETTING_TOGGLE_SHORTCUT = "rui.ToggleShortcut";
+// 使用频率配色默认值（按阈值升序）：超过 N 次时，节点名称显示对应颜色
+const DEFAULT_USE_COLORS = [
+    { threshold: 10,  color: "#60ce7f" },
+    { threshold: 20,  color: "#3b6cdc" },
+    { threshold: 30,  color: "#9c00ff" },
+    { threshold: 50,  color: "#fffc00" },
+    { threshold: 100, color: "#cda56d" },
+];
+
+let nodeFavoritesInstance = null;
+
+class Rui {
+    constructor() {
+        this.favorites = this.loadFavorites();
+        this.panel = null;
+        this.searchInput = null;
+        this.favoritesList = null;
+        this.categoryList = null;
+        this.currentCategory = "all";
+        this.currentSearch = "";
+        this.initialized = false;
+        this.draggingNodeType = null;
+        this.draggingWorkflowId = null;
+        this._previewEl = null;
+        this._previewCanvasCache = new Map();
+        this._previewHideTimer = null;
+        this._previewToken = 0;
+
+        this.init();
+    }
+
+    loadFavorites() {
+        try {
+            const data = localStorage.getItem(STORAGE_KEY);
+            if (data) {
+                const parsed = JSON.parse(data);
+                if (!parsed.categories) {
+                    parsed.categories = [{ id: "default", name: ruiT('默认收藏','Default Favorites'), order: 0 }];
+                }
+                parsed.categories.forEach((c, i) => {
+                    if (c.order === undefined) c.order = i;
+                });
+                if (!parsed.nodes) {
+                    parsed.nodes = [];
+                }
+                if (!parsed.workflows) {
+                    parsed.workflows = [];
+                }
+                if (!parsed.sortMode) {
+                    parsed.sortMode = "default";
+                }
+                parsed.nodes.forEach((n, i) => {
+                    if (n.order === undefined) n.order = Date.now() + i;
+                    if (n.useCount === undefined) n.useCount = 0;
+                    if (n.lastUsed === undefined) n.lastUsed = 0;
+                });
+                parsed.workflows.forEach((w, i) => {
+                    if (w.useCount === undefined) w.useCount = 0;
+                    if (w.lastUsed === undefined) w.lastUsed = 0;
+                    if (w.addedAt === undefined) w.addedAt = Date.now() + i;
+                });
+                if (!parsed.useColors || !Array.isArray(parsed.useColors) || parsed.useColors.length === 0) {
+                    parsed.useColors = DEFAULT_USE_COLORS.map(x => ({ ...x }));
+                }
+                if (typeof parsed.useColorsEnabled !== "boolean") parsed.useColorsEnabled = true;
+                if (!parsed.activeBarColor) parsed.activeBarColor = "#FFD700";
+                return parsed;
+            }
+        } catch (e) {
+            console.error("加载收藏失败:", e);
+        }
+        return {
+            categories: [{ id: "default", name: ruiT('默认收藏','Default Favorites'), order: 0 }],
+            nodes: [],
+            workflows: [],
+            sortMode: "default",
+            useColors: DEFAULT_USE_COLORS.map(x => ({ ...x })),
+            useColorsEnabled: true,
+            activeBarColor: "#FFD700"
+        };
+    }
+
+    /** 应用选中分类左侧色条颜色（通过 CSS 变量 --nf-active-bar） */
+    applyActiveBarColor(color) {
+        if (!color) color = "#FFD700";
+        document.documentElement.style.setProperty("--nf-active-bar", color);
+    }
+
+    saveFavorites() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(this.favorites));
+        } catch (e) {
+            console.error("保存收藏失败:", e);
+        }
+    }
+
+    /** 根据使用次数返回着色等级与颜色（阈值/颜色均可在设置面板自定义） */
+    getUseLevel(count) {
+        const c = count || 0;
+        const cfg = (this.favorites && this.favorites.useColors) || DEFAULT_USE_COLORS;
+        let best = { level: 0, color: "", threshold: -1 };
+        for (let i = 0; i < cfg.length; i++) {
+            const t = cfg[i].threshold;
+            if (c > t && t > best.threshold) {
+                best = { level: i + 1, color: cfg[i].color, threshold: t };
+            }
+        }
+        delete best.threshold;
+        return best;
+    }
+
+    /** 频率配色设置对话框（与工作流一致：开关 + 阈值/颜色自定义 + 重置） */
+    showSettingsDialog() {
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay nf-use-settings-overlay";
+        dialog.dataset.ruiRole = "settings";
+        const cfg = this.favorites.useColors || DEFAULT_USE_COLORS;
+        const rows = cfg.map((item, i) => `
+            <div class="nf-use-row">
+                <span class="nf-use-rank">${i + 1}</span>
+                <input type="color" class="nf-use-color" data-idx="${i}" value="${item.color}" />
+                <span class="nf-use-label">${ruiT('超过', 'over')}</span>
+                <input type="number" class="nf-use-threshold" data-idx="${i}" value="${item.threshold}" min="0" step="1" />
+                <span class="nf-use-label">${ruiT('次', 'times')}</span>
+            </div>
+        `).join("");
+
+        dialog.innerHTML = `
+            <div class="nf-dialog nf-use-settings-dialog">
+                <div class="nf-dialog-title">${ruiT('设置', 'Settings')}</div>
+                <div class="nf-dialog-body">
+                    <div class="nf-use-settings-section">
+                        <div class="nf-active-bar-row">
+                            <span>${ruiT('选中色条颜色', 'Selected bar color')}</span>
+                            <input type="color" id="nf-active-bar-input" value="" />
+                        </div>
+                    </div>
+                    <div class="nf-use-settings-section">
+                        <div class="nf-use-switch ${this.favorites.useColorsEnabled !== false ? 'active' : ''}" id="nf-use-toggle">
+                            <span>${ruiT('根据使用频率变色', 'Color by usage frequency')}</span>
+                            <span class="nf-use-toggle"><i></i></span>
+                        </div>
+                        ${rows}
+                    </div>
+                </div>
+                <div class="nf-use-settings-footer">
+                    <div class="nf-use-settings-actions">
+                        <button class="nf-use-dialog-btn nf-use-dialog-btn-cancel" id="nf-settings-reset">${ruiT('恢复默认', 'Reset')}</button>
+                        <button class="nf-use-dialog-btn nf-use-dialog-btn-confirm" id="nf-settings-close">${ruiT('完成', 'Done')}</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(dialog);
+
+        const useToggle = dialog.querySelector("#nf-use-toggle");
+        if (useToggle) {
+            useToggle.addEventListener("click", () => {
+                const on = this.favorites.useColorsEnabled === false;
+                this.favorites.useColorsEnabled = on;
+                useToggle.classList.toggle("active", on);
+                this.saveFavorites();
+                this.renderFavorites();
+            });
+        }
+
+        // 允许拖动设置面板（按住标题栏）
+        const dragPanel = dialog.querySelector(".nf-dialog");
+        const dragHandle = dialog.querySelector(".nf-dialog-title");
+        if (dragPanel && dragHandle) {
+            let dragging = false, startX = 0, startY = 0, origX = 0, origY = 0;
+            dragHandle.style.cursor = "move";
+            dragHandle.addEventListener("mousedown", (e) => {
+                dragging = true;
+                const r = dragPanel.getBoundingClientRect();
+                dragPanel.style.position = "fixed";
+                dragPanel.style.margin = "0";
+                dragPanel.style.left = r.left + "px";
+                dragPanel.style.top = r.top + "px";
+                startX = e.clientX;
+                startY = e.clientY;
+                origX = r.left;
+                origY = r.top;
+                e.preventDefault();
+            });
+            window.addEventListener("mousemove", (e) => {
+                if (!dragging) return;
+                dragPanel.style.left = (origX + e.clientX - startX) + "px";
+                dragPanel.style.top = (origY + e.clientY - startY) + "px";
+            });
+            window.addEventListener("mouseup", () => { dragging = false; });
+        }
+
+        let renderTimer = null;
+        const scheduleCommit = () => {
+            if (renderTimer) clearTimeout(renderTimer);
+            renderTimer = setTimeout(() => {
+                renderTimer = null;
+                this.saveFavorites();
+                this.renderFavorites();
+            }, 120);
+        };
+
+        dialog.querySelectorAll(".nf-use-color").forEach(inp => {
+            inp.addEventListener("input", (e) => {
+                const idx = +e.target.dataset.idx;
+                if (this.favorites.useColors[idx]) {
+                    this.favorites.useColors[idx].color = e.target.value;
+                    scheduleCommit();
+                }
+            });
+        });
+        dialog.querySelectorAll(".nf-use-threshold").forEach(inp => {
+            inp.addEventListener("input", (e) => {
+                const idx = +e.target.dataset.idx;
+                if (this.favorites.useColors[idx]) {
+                    const v = parseInt(e.target.value, 10);
+                    this.favorites.useColors[idx].threshold = isNaN(v) ? 0 : v;
+                    scheduleCommit();
+                }
+            });
+        });
+        const barInput = dialog.querySelector("#nf-active-bar-input");
+        if (barInput) {
+            barInput.value = this.favorites.activeBarColor || "#FFD700";
+            barInput.addEventListener("input", (e) => {
+                this.favorites.activeBarColor = e.target.value;
+                this.applyActiveBarColor(e.target.value);
+                scheduleCommit();
+            });
+        }
+
+        dialog.querySelector("#nf-settings-reset").addEventListener("click", () => {
+            this.favorites.useColors = DEFAULT_USE_COLORS.map(x => ({ ...x }));
+            this.favorites.useColorsEnabled = true;
+            this.favorites.activeBarColor = "#FFD700";
+            this.applyActiveBarColor("#FFD700");
+            this.saveFavorites();
+            dialog.remove();
+            this.showSettingsDialog();
+        });
+
+        const close = () => {
+            if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+            this.saveFavorites();
+            this.renderFavorites();
+            dialog.remove();
+        };
+        dialog.querySelector("#nf-settings-close").addEventListener("click", close);
+        dialog.addEventListener("mousedown", (e) => { if (e.target === dialog) close(); });
+    }
+
+
+    init() {
+        if (this.initialized) return;
+        this.initialized = true;
+
+        try {
+            this.injectCSS();
+            this.setupKeyboardListener();
+            this.setupDragDrop();
+            this.waitForCanvasReady().then(() => {
+                this._patchRuiTitleCreate();
+                this.createPanel();
+                this.extendNodeMenu();
+                this.extendCanvasMenu();
+                this.extendGroupMenu();
+            });
+        } catch (e) {
+            console.error("Rui 初始化失败:", e);
+        }
+    }
+
+    setupDragDrop() {
+        const self = this;
+
+        document.addEventListener("mousemove", (e) => {
+            if (self.draggingNodeType || self.draggingWorkflowId) {
+                self.updateDragPreview(e.clientX, e.clientY);
+            }
+        });
+
+        document.addEventListener("mouseup", (e) => {
+            if (self.draggingNodeType) {
+                const canvas = app.canvas;
+                if (canvas && canvas.canvas) {
+                    const rect = canvas.canvas.getBoundingClientRect();
+                    if (e.clientX >= rect.left && e.clientX <= rect.right &&
+                        e.clientY >= rect.top && e.clientY <= rect.bottom) {
+                        const offsetX = e.clientX - rect.left;
+                        const offsetY = e.clientY - rect.top;
+                        const pos = canvas.convertCanvasToOffset([offsetX, offsetY]);
+                        if (pos) {
+                            self.addNodeToCanvasAt(self.draggingNodeType, pos[0], pos[1]);
+                        } else {
+                            self.addNodeToCanvasAt(self.draggingNodeType, offsetX, offsetY);
+                        }
+                        self.collapsePanel();
+                    }
+                }
+                self.removeDragPreview();
+                self.draggingNodeType = null;
+            } else if (self.draggingWorkflowId) {
+                const canvas = app.canvas;
+                if (canvas && canvas.canvas) {
+                    const rect = canvas.canvas.getBoundingClientRect();
+                    if (e.clientX >= rect.left && e.clientX <= rect.right &&
+                        e.clientY >= rect.top && e.clientY <= rect.bottom) {
+                        const offsetX = e.clientX - rect.left;
+                        const offsetY = e.clientY - rect.top;
+                        const pos = canvas.convertCanvasToOffset([offsetX, offsetY]);
+                        if (pos) {
+                            self.addWorkflowToCanvasAt(self.draggingWorkflowId, pos[0], pos[1]);
+                        } else {
+                            self.addWorkflowToCanvasAt(self.draggingWorkflowId, offsetX, offsetY);
+                        }
+                        self.collapsePanel();
+                    }
+                }
+                self.removeDragPreview();
+                self.draggingWorkflowId = null;
+            }
+        });
+    }
+
+    updateDragPreview(x, y, name = "") {
+        let preview = document.getElementById("nf-drag-preview");
+        if (!preview) {
+            preview = document.createElement("div");
+            preview.id = "nf-drag-preview";
+            preview.style.cssText = `
+                position: fixed;
+                padding: 10px 18px;
+                background: linear-gradient(135deg, #4CAF50, #45a049);
+                color: white;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 500;
+                pointer-events: none;
+                z-index: 10000;
+                white-space: nowrap;
+                box-shadow: 0 6px 20px rgba(76, 175, 80, 0.4);
+                border: 2px solid rgba(255,255,255,0.2);
+                transform: translate(-50%, -50%);
+                opacity: 0.95;
+            `;
+            document.body.appendChild(preview);
+        }
+        preview.textContent = name || ruiT('拖动中...','Dragging...');
+        preview.style.left = x + "px";
+        preview.style.top = y + "px";
+    }
+
+    removeDragPreview() {
+        const preview = document.getElementById("nf-drag-preview");
+        if (preview) {
+            preview.remove();
+        }
+    }
+
+    recordUse(nodeType) {
+        const node = this.favorites.nodes.find(n => n.type === nodeType);
+        if (node) {
+            node.useCount = (node.useCount || 0) + 1;
+            node.lastUsed = Date.now();
+            this.saveFavorites();
+            this.renderFavorites();
+        }
+    }
+
+    isNodeTypeValid(nodeType) {
+        try {
+            if (typeof LiteGraph === 'undefined') return true;
+            if (LiteGraph.registered_node_types && nodeType in LiteGraph.registered_node_types) return true;
+            if (LiteGraph.Nodes && nodeType in LiteGraph.Nodes) return true;
+            return false;
+        } catch (e) {
+            return true;
+        }
+    }
+
+    getInvalidFavorites() {
+        return this.favorites.nodes.filter(n => !this.isNodeTypeValid(n.type));
+    }
+
+    removeInvalidFavorites() {
+        const invalid = this.getInvalidFavorites();
+        const count = invalid.length;
+        if (count === 0) return 0;
+        this.favorites.nodes = this.favorites.nodes.filter(n => this.isNodeTypeValid(n.type));
+        this.saveFavorites();
+        this.renderFavorites();
+        this.renderCategories();
+        return count;
+    }
+
+    addNodeToCanvasAt(nodeType, canvasX, canvasY) {
+        this.recordUse(nodeType);
+        try {
+            const node = LiteGraph.createNode(nodeType);
+            if (!node) {
+                console.error(`无法创建节点: ${nodeType}`);
+                return;
+            }
+
+            const canvas = app.canvas;
+            if (!canvas || !app.graph) {
+                console.error("画布或图未初始化");
+                return;
+            }
+
+            node.pos = [canvasX, canvasY];
+            app.graph.add(node);
+            canvas.setDirty(true, true);
+
+            if (node.onAdded) {
+                node.onAdded();
+            }
+
+            app.graph.change();
+        } catch (e) {
+            console.error("添加节点到画布失败:", e);
+        }
+    }
+
+    getShortcut() {
+        try {
+            const stored = localStorage.getItem(SETTING_TOGGLE_SHORTCUT);
+            if (stored) {
+                return JSON.parse(stored);
+            }
+        } catch (e) {}
+        return { key: "q", ctrl: false, alt: false, shift: false, meta: false };
+    }
+
+    saveShortcut(shortcut) {
+        localStorage.setItem(SETTING_TOGGLE_SHORTCUT, JSON.stringify(shortcut));
+    }
+
+    getOutputNodes(nodes) {
+        if (!nodes || !nodes.length) return [];
+        return nodes.filter((n) => {
+            return n.mode != LiteGraph.NEVER && n.constructor?.nodeData?.output_node;
+        });
+    }
+
+    recursiveAddQueueNodes(nodeId, oldOutput, newOutput) {
+        let currentId = String(nodeId);
+        let currentNode = oldOutput[currentId];
+        if (newOutput[currentId] == null && currentNode) {
+            newOutput[currentId] = currentNode;
+            for (const inputValue of Object.values(currentNode.inputs || [])) {
+                if (Array.isArray(inputValue)) {
+                    this.recursiveAddQueueNodes(inputValue[0], oldOutput, newOutput);
+                }
+            }
+        }
+        return newOutput;
+    }
+
+    async queueSelectedOutputNodes() {
+        const selectedNodes = Object.values(app.canvas.selected_nodes || {});
+        const outputNodes = this.getOutputNodes(selectedNodes);
+        if (!outputNodes.length) return;
+
+        const rgthree = window.rgthree;
+        if (rgthree && typeof rgthree.queueOutputNodes === "function") {
+            rgthree.queueOutputNodes(outputNodes);
+            return;
+        }
+
+        const nodeIds = outputNodes.map((n) => n.id);
+        const origApiQueuePrompt = api.queuePrompt;
+        let hookInstalled = false;
+
+        const hook = async function (index, prompt, ...args) {
+            if (prompt.output) {
+                const oldOutput = prompt.output;
+                let newOutput = {};
+                for (const queueNodeId of nodeIds) {
+                    nodeFavoritesInstance.recursiveAddQueueNodes(queueNodeId, oldOutput, newOutput);
+                }
+                prompt.output = newOutput;
+            }
+            api.queuePrompt = origApiQueuePrompt;
+            return origApiQueuePrompt.call(api, index, prompt, ...args);
+        };
+
+        try {
+            api.queuePrompt = hook;
+            hookInstalled = true;
+            await app.queuePrompt(0);
+        } catch (e) {
+            console.error("[Rui] 排队选中输出节点失败:", e);
+        } finally {
+            if (hookInstalled) {
+                api.queuePrompt = origApiQueuePrompt;
+            }
+        }
+    }
+
+    setupKeyboardListener() {
+        const self = this;
+
+        document.addEventListener("keydown", function handler(e) {
+            if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) {
+                return;
+            }
+
+            if (!e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey && e.key.toLowerCase() === "d") {
+                e.preventDefault();
+                e.stopPropagation();
+                self.queueSelectedOutputNodes();
+                return;
+            }
+
+            const shortcut = self.getShortcut();
+            if (!shortcut || !shortcut.key) return;
+
+            const key = e.key.toLowerCase();
+            if (key !== shortcut.key.toLowerCase()) return;
+
+            if (!!e.ctrlKey !== !!shortcut.ctrl) return;
+            if (!!e.altKey !== !!shortcut.alt) return;
+            if (!!e.shiftKey !== !!shortcut.shift) return;
+            if (!!e.metaKey !== !!shortcut.meta) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+            self.togglePanel();
+        });
+    }
+
+    async waitForCanvasReady() {
+        return new Promise((resolve) => {
+            let attempts = 0;
+            const maxAttempts = 100;
+
+            const checkReady = () => {
+                attempts++;
+
+                if (typeof LGraphCanvas !== "undefined" &&
+                    document.querySelector(".litegraph") &&
+                    app && app.graph) {
+                    setTimeout(resolve, 100);
+                    return;
+                }
+
+                if (attempts >= maxAttempts) {
+                    console.warn("Rui: 等待画布超时，继续初始化");
+                    setTimeout(resolve, 500);
+                    return;
+                }
+
+                requestAnimationFrame(checkReady);
+            };
+
+            checkReady();
+        });
+    }
+
+    injectCSS() {
+        if (document.getElementById("node-favorites-styles")) return;
+
+        const style = document.createElement("style");
+        style.id = "node-favorites-styles";
+        style.textContent = this.getCSS();
+        document.head.appendChild(style);
+    }
+
+    getCSS() {
+        return `
+            #node-favorites-panel {
+                position: fixed;
+                top: 100px;
+                right: 10px;
+                width: 460px;
+                height: 70vh;
+                background: rgba(30, 30, 30, 0.95);
+                border: 1px solid #444;
+                border-radius: 8px;
+                color: #ddd;
+                font-family: Arial, sans-serif;
+                font-size: 14px;
+                z-index: 1000;
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+                user-select: none;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .nf-panel-resizer {
+                position: absolute;
+                top: 0;
+                right: -4px;
+                bottom: 0;
+                width: 8px;
+                cursor: ew-resize;
+                z-index: 10;
+                border-radius: 0 4px 4px 0;
+                transition: background 0.2s;
+            }
+            .nf-panel-resizer:hover,
+            .nf-panel-resizer.dragging {
+                background: rgba(76, 175, 80, 0.4);
+            }
+
+            .nf-panel-bottom-resizer {
+                position: absolute;
+                left: 0;
+                right: 0;
+                bottom: -4px;
+                height: 8px;
+                cursor: ns-resize;
+                z-index: 10;
+                border-radius: 0 0 4px 4px;
+                transition: background 0.2s;
+            }
+            .nf-panel-bottom-resizer:hover,
+            .nf-panel-bottom-resizer.dragging {
+                background: rgba(76, 175, 80, 0.4);
+            }
+
+            #node-favorites-panel.collapsed {
+                display: none;
+            }
+
+            #node-favorites-panel * {
+                box-sizing: border-box;
+            }
+
+            .nf-icon-btn {
+                display: none;
+            }
+
+            #node-favorites-panel.collapsed .nf-header,
+            #node-favorites-panel.collapsed .nf-content {
+                display: none;
+            }
+
+            .nf-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 10px 12px;
+                background: rgba(50, 50, 50, 0.8);
+                border-bottom: 1px solid #444;
+                border-radius: 8px 8px 0 0;
+                cursor: move;
+                user-select: none;
+                flex-shrink: 0;
+            }
+
+            .nf-header:active {
+                cursor: grabbing;
+            }
+
+            .nf-title {
+                font-weight: bold;
+                font-size: 14px;
+            }
+
+            .nf-header-btns {
+                display: flex;
+                gap: 6px;
+                align-items: center;
+            }
+
+            .nf-header-btn {
+                background: transparent;
+                border: 1px solid #666;
+                color: #ddd;
+                width: auto;
+                min-width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 12px;
+                line-height: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0 6px;
+                white-space: nowrap;
+            }
+
+            .nf-header-btn:hover {
+                background: #555;
+                border-color: #888;
+            }
+
+            .nf-toggle-btn {
+                background: transparent;
+                border: 1px solid #666;
+                color: #ddd;
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 16px;
+                line-height: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .nf-toggle-btn:hover {
+                background: #555;
+                border-color: #888;
+            }
+
+            .nf-shortcut-display {
+                background: transparent;
+                border: 1px solid #666;
+                color: #ddd;
+                font-weight: bold;
+                font-size: 10px;
+                height: 24px;
+                min-width: 24px;
+                padding: 0 6px;
+            }
+
+            .nf-shortcut-display:hover {
+                background: #555;
+                border-color: #888;
+            }
+
+            .nf-content {
+                padding: 10px;
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            .nf-tab-bar {
+                display: flex;
+                gap: 4px;
+                margin-bottom: 10px;
+                flex-shrink: 0;
+                background: #1a1a1a;
+                padding: 3px;
+                border-radius: 6px;
+            }
+
+            .nf-tab-btn {
+                flex: 1;
+                text-align: center;
+                font-size: 14px;
+                padding: 6px 0;
+                font-size: 12px;
+                color: #999;
+                cursor: pointer;
+                border-radius: 4px;
+                transition: all 0.2s;
+            }
+
+            .nf-tab-btn:hover {
+                color: #ddd;
+                background: #2a2a2a;
+            }
+
+            .nf-tab-btn.active {
+                color: #fff;
+                background: #3a3a3a;
+                font-weight: 600;
+            }
+
+            .nf-tab-content {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            .nf-notes-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+                flex-shrink: 0;
+                font-size: 13px;
+                color: #ccc;
+            }
+
+            .nf-notes-count {
+                font-size: 11px;
+                color: #888;
+            }
+
+            .nf-notes-textarea {
+                flex: 1;
+                width: 100%;
+                resize: none;
+                background: #1a1a1a;
+                border: 1px solid #333;
+                border-radius: 4px;
+                color: #ddd;
+                font-size: 13px;
+                line-height: 1.6;
+                padding: 10px;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+                outline: none;
+                box-sizing: border-box;
+            }
+
+            .nf-notes-textarea:focus {
+                border-color: #4CAF50;
+            }
+
+            .nf-notes-textarea::placeholder {
+                color: #555;
+            }
+
+            .nf-notes-tab-bar {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                flex-shrink: 0;
+                margin-bottom: 8px;
+                min-height: 30px;
+            }
+            .nf-notes-tab-scroll {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                flex: 1;
+                overflow-x: auto;
+                padding: 2px 0;
+                scrollbar-width: thin;
+            }
+            .nf-notes-tab-scroll::-webkit-scrollbar {
+                height: 4px;
+            }
+            .nf-notes-tab-scroll::-webkit-scrollbar-thumb {
+                background: #444;
+                border-radius: 2px;
+            }
+            .nf-notes-tab-item {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px 10px;
+                background: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                color: #aaa;
+                font-size: 12px;
+                cursor: pointer;
+                white-space: nowrap;
+                flex-shrink: 0;
+                user-select: none;
+                transition: all 0.15s;
+            }
+            .nf-notes-tab-item:hover {
+                border-color: #555;
+                color: #ddd;
+            }
+            .nf-notes-tab-item.active {
+                background: rgba(76, 175, 80, 0.15);
+                border-color: #4CAF50;
+                color: #4CAF50;
+                font-weight: 600;
+            }
+            .nf-notes-tab-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                flex-shrink: 0;
+                box-shadow: 0 0 2px rgba(0,0,0,0.4);
+            }
+            .nf-notes-tab-name {
+                max-width: 110px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .nf-notes-tab-name[contenteditable="true"] {
+                outline: 1px dashed #FFD700;
+                color: #FFD700;
+                background: rgba(255,215,0,0.08);
+                padding: 0 2px;
+                border-radius: 2px;
+                cursor: text;
+            }
+            .nf-notes-tab-del {
+                width: 14px;
+                height: 14px;
+                border-radius: 50%;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                color: #888;
+                font-size: 11px;
+                line-height: 1;
+                flex-shrink: 0;
+            }
+            .nf-notes-tab-del:hover {
+                background: #FF5252;
+                color: #fff;
+            }
+            .nf-notes-tab-add {
+                width: 26px;
+                height: 26px;
+                border-radius: 4px;
+                background: #2a2a2a;
+                border: 1px dashed #555;
+                color: #888;
+                font-size: 16px;
+                line-height: 1;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            .nf-notes-tab-add:hover {
+                border-color: #4CAF50;
+                color: #4CAF50;
+                background: rgba(76,175,80,0.1);
+            }
+
+            .nf-search-box {
+                position: relative;
+                margin-bottom: 10px;
+                flex-shrink: 0;
+            }
+
+            .nf-split-container {
+                display: flex;
+                gap: 10px;
+                flex: 1;
+                overflow: hidden;
+            }
+
+            .nf-left-col {
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                flex-shrink: 0;
+            }
+
+            .nf-split-handle {
+                width: 4px;
+                cursor: col-resize;
+                background: #444;
+                flex-shrink: 0;
+                transition: background 0.2s;
+            }
+            .nf-split-handle:hover {
+                background: #4CAF50;
+            }
+
+            .nf-right-col {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            #nf-search-input {
+                width: 100%;
+                padding: 8px 30px 8px 10px;
+                background: #2a2a2a;
+                border: 1px solid #555;
+                border-radius: 4px;
+                color: #ddd;
+                font-size: 13px;
+            }
+
+            #nf-search-input:focus {
+                outline: none;
+            }
+
+            .nf-clear-btn {
+                position: absolute;
+                right: 8px;
+                top: 50%;
+                transform: translateY(-50%);
+                background: transparent;
+                border: none;
+                color: #888;
+                cursor: pointer;
+                font-size: 14px;
+                padding: 4px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: 3px;
+            }
+
+            .nf-clear-btn:hover {
+                background: #555;
+                color: #fff;
+            }
+        ` + this.getCategoryCSS() + this.getFavoritesCSS() + this.getUseColorsCSS() + this.getDialogCSS();
+    }
+
+    getCategoryCSS() {
+        return `
+            .nf-categories-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 4px 0 8px 0;
+                font-weight: bold;
+                color: #aaa;
+                font-size: 14px;
+                text-transform: uppercase;
+                flex-shrink: 0;
+            }
+
+            .nf-add-cat-btn {
+                background: #3a3a3a;
+                border: 1px solid #555;
+                color: #aaa;
+                width: 22px;
+                height: 22px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                line-height: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .nf-add-cat-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-category-list {
+                display: flex;
+                flex-direction: column;
+                gap: 3px;
+                overflow-y: auto;
+                flex: 1;
+                padding-right: 2px;
+            }
+
+            .nf-category-item {
+                display: flex;
+                align-items: center;
+                padding: 6px 8px;
+                background: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                cursor: pointer;
+                transition: all 0.2s;
+                gap: 8px;
+            }
+
+            .nf-category-item:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-category-item.active {
+                border-left: 2px solid var(--nf-active-bar, #FFD700);
+                padding-left: 6px;
+            }
+
+            .nf-cat-drag-handle {
+                flex: none;
+                cursor: grab;
+                color: #666;
+                font-size: 14px;
+                line-height: 1;
+                user-select: none;
+                transition: color 0.15s;
+            }
+            .nf-cat-drag-handle:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+            .nf-cat-drag-handle:active {
+                cursor: grabbing;
+            }
+            .nf-category-item.nf-cat-dragging {
+                opacity: 0.5;
+                border-style: dashed;
+                border-color: #4CAF50;
+            }
+            .nf-cat-insert-indicator {
+                height: 3px;
+                flex: none;
+                border-radius: 2px;
+                background: #4CAF50;
+                box-shadow: 0 0 6px rgba(76, 175, 80, 0.8);
+                margin: 0;
+            }
+            .nf-cat-name {
+                flex: 1;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            .nf-cat-invalid-count {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+                font-size: 10px;
+                padding: 1px 6px;
+                border-radius: 8px;
+                flex-shrink: 0;
+                font-weight: 600;
+            }
+
+        `;
+    }
+
+    getFavoritesCSS() {
+        return `
+            .nf-favorites-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 4px 0 8px 0;
+                font-weight: bold;
+                color: #aaa;
+                font-size: 14px;
+                text-transform: uppercase;
+                flex-shrink: 0;
+            }
+
+            .nf-fav-header-left {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+
+            .nf-sort-btns {
+                display: flex;
+                gap: 4px;
+            }
+
+            .nf-sort-btn {
+                background: #3a3a3a;
+                border: 1px solid #555;
+                color: #888;
+                width: 24px;
+                height: 22px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 12px;
+                line-height: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                transition: all 0.2s;
+            }
+
+            .nf-sort-btn:hover {
+                background: #444;
+                color: #ccc;
+                border-color: #666;
+            }
+
+            .nf-sort-btn.active {
+                background: rgba(76, 175, 80, 0.2);
+                border-color: #4CAF50;
+                color: #4CAF50;
+            }
+
+            .nf-count {
+                background: #444;
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-size: 11px;
+            }
+
+            .nf-clear-invalid-btn {
+                background: rgba(255,107,107,0.15);
+                border: 1px solid rgba(255,107,107,0.4);
+                color: #ff6b6b;
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-size: 11px;
+                cursor: pointer;
+                line-height: 1;
+                transition: all 0.2s;
+            }
+            .nf-clear-invalid-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-favorites-list {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                overflow-y: auto;
+                flex: 1;
+                padding-right: 2px;
+            }
+
+            .nf-fav-item {
+                display: flex;
+                align-items: center;
+                padding: 8px;
+                background: #2a2a2a;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                cursor: grab;
+                transition: all 0.2s;
+                gap: 8px;
+                user-select: none;
+            }
+
+            .nf-fav-item:active {
+                cursor: grabbing;
+            }
+
+            .nf-fav-item:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-fav-item.nf-reorder-dragging {
+                opacity: 0.5;
+                background: #3a3a3a;
+                border-color: #4CAF50;
+            }
+
+            .nf-fav-drag-handle {
+                color: #666;
+                cursor: grab;
+                font-size: 12px;
+                padding: 2px 4px;
+                border-radius: 3px;
+                flex-shrink: 0;
+                user-select: none;
+            }
+
+            .nf-fav-drag-handle:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-fav-info {
+                flex: 1;
+                min-width: 0;
+            }
+
+            .nf-fav-name {
+                font-weight: 500;
+                font-size: 14px;
+                color: #ddd;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .nf-fav-type {
+                font-size: 12px;
+                color: #888;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .nf-fav-actions {
+                display: flex;
+                gap: 4px;
+            }
+
+            .nf-fav-item.nf-invalid {
+                opacity: 0.55;
+                cursor: default;
+                border-color: rgba(255,107,107,0.25);
+            }
+            .nf-fav-item.nf-invalid:hover {
+                transform: none;
+                background: rgba(255, 107, 107, 0.12);
+            }
+
+            .nf-del-invalid-btn {
+                background: transparent;
+                border: 1px solid rgba(255,107,107,0.4);
+                color: #ff6b6b;
+                width: 22px;
+                height: 22px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                line-height: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                flex-shrink: 0;
+                transition: all 0.2s;
+            }
+            .nf-del-invalid-btn:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-empty-tip {
+                text-align: center;
+                padding: 30px 10px;
+                color: #666;
+                font-size: 12px;
+                line-height: 1.8;
+            }
+
+            .nf-content::-webkit-scrollbar {
+                width: 6px;
+            }
+
+            .nf-content::-webkit-scrollbar-track {
+                background: #1e1e1e;
+            }
+
+            .nf-content::-webkit-scrollbar-thumb {
+                background: #444;
+                border-radius: 3px;
+            }
+
+            .nf-content::-webkit-scrollbar-thumb:hover {
+                background: #555;
+            }
+
+            .nf-shortcut-bar {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 8px 10px;
+                background: rgba(76, 175, 80, 0.1);
+                border: 1px solid rgba(76, 175, 80, 0.3);
+                border-radius: 4px;
+                margin-bottom: 10px;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+
+            .nf-shortcut-bar:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-shortcut-label {
+                font-size: 11px;
+                color: #888;
+            }
+
+            .nf-shortcut-key {
+                font-size: 12px;
+                font-weight: bold;
+                color: #4CAF50;
+                background: #2a2a2a;
+                padding: 3px 8px;
+                border-radius: 3px;
+                border: 1px solid #444;
+            }
+
+            .nf-shortcut-hint {
+                font-size: 10px;
+                color: #666;
+            }
+        `;
+    }
+
+    getUseColorsCSS() {
+        return `
+            /* 按使用频率变化收藏节点名称颜色 */
+            .nf-fav-item.nf-fav-use-l1 .nf-fav-name,
+            .nf-fav-item.nf-fav-use-l2 .nf-fav-name,
+            .nf-fav-item.nf-fav-use-l3 .nf-fav-name,
+            .nf-fav-item.nf-fav-use-l4 .nf-fav-name,
+            .nf-fav-item.nf-fav-use-l5 .nf-fav-name {
+                color: var(--nf-use-color, #ddd);
+            }
+
+            /* 频率配色设置对话框 */
+            .nf-use-settings-overlay {
+                background: transparent;
+            }
+            .nf-dialog.nf-use-settings-dialog {
+                min-width: 0;
+                max-width: 210px;
+                width: 210px;
+            }
+            .nf-use-settings-dialog .nf-dialog-body {
+                display: flex;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 16px;
+                padding: 12px;
+            }
+            .nf-use-settings-section { margin: 0; }
+            .nf-active-bar-row {
+                display: flex;
+                align-items: center;
+                justify-content: flex-start;
+                gap: 8px;
+                font-size: 13px;
+                color: var(--fg, #ddd);
+            }
+            .nf-active-bar-row input[type="color"] {
+                width: 40px;
+                height: 24px;
+                padding: 0;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #2a2a2a;
+                cursor: pointer;
+            }
+            .nf-use-switch {
+                display: flex;
+                align-items: center;
+                justify-content: flex-start;
+                gap: 8px;
+                font-size: 13px;
+                color: var(--fg, #ddd);
+                cursor: pointer;
+                user-select: none;
+                width: auto;
+                flex-wrap: nowrap;
+            }
+            .nf-use-toggle {
+                position: relative;
+                width: 40px;
+                height: 22px;
+                border-radius: 11px;
+                background: #555;
+                transition: background 0.2s;
+                flex-shrink: 0;
+            }
+            .nf-use-toggle i {
+                position: absolute;
+                top: 2px;
+                left: 2px;
+                width: 18px;
+                height: 18px;
+                border-radius: 50%;
+                background: #fff;
+                transition: left 0.2s;
+            }
+            .nf-use-switch.active .nf-use-toggle { background: #4CAF50; }
+            .nf-use-switch.active .nf-use-toggle i { left: 20px; }
+
+            .nf-use-row {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-top: 12px;
+            }
+            .nf-use-rank {
+                width: 18px;
+                height: 18px;
+                border-radius: 50%;
+                background: #444;
+                color: #ddd;
+                font-size: 11px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+            }
+            .nf-use-row input[type="color"] {
+                width: 41px;
+                height: 28px;
+                padding: 0;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: #3a3a3a;
+                cursor: pointer;
+            }
+            .nf-use-threshold {
+                width: 48px;
+                padding: 5px 6px;
+                font-size: 13px;
+                text-align: center;
+                background: var(--comfy-input-bg, #3a3a3a);
+                color: var(--fg, #ddd);
+                border: 1px solid var(--border-color, #555);
+                border-radius: 4px;
+                outline: none;
+            }
+            .nf-use-threshold::-webkit-outer-spin-button,
+            .nf-use-threshold::-webkit-inner-spin-button {
+                -webkit-appearance: none;
+                margin: 0;
+            }
+            .nf-use-threshold { -moz-appearance: textfield; }
+            .nf-use-label {
+                font-size: 13px;
+                color: var(--fg, #ddd);
+                white-space: nowrap;
+            }
+            .nf-use-settings-footer {
+                display: flex;
+                justify-content: center;
+                padding: 10px 16px 14px;
+            }
+            .nf-use-settings-actions {
+                display: flex;
+                gap: 10px;
+            }
+            .nf-use-dialog-btn {
+                padding: 6px 12px;
+                font-size: 13px;
+                font-weight: normal;
+                background: transparent;
+                color: var(--fg, #ddd);
+                border: 1px solid var(--border-color, #555);
+                border-radius: 4px;
+                cursor: pointer;
+                transition: all 0.15s;
+            }
+            .nf-use-dialog-btn-cancel,
+            .nf-use-dialog-btn-confirm {
+                background: transparent;
+                font-weight: normal;
+                color: var(--fg, #ddd);
+                border: 1px solid var(--border-color, #555);
+            }
+            .nf-use-dialog-btn-cancel:hover,
+            .nf-use-dialog-btn-confirm:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+        `;
+    }
+
+    getDialogCSS() {
+        return `
+            .nf-dialog-overlay {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0, 0, 0, 0.6);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 9999;
+            }
+
+            .nf-dialog {
+                background: #2a2a2a;
+                border: 1px solid #444;
+                border-radius: 8px;
+                min-width: 300px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            }
+
+            .nf-dialog-title {
+                padding: 12px 16px;
+                border-bottom: 1px solid #444;
+                font-weight: bold;
+                color: #ddd;
+            }
+
+            .nf-dialog-body {
+                padding: 16px;
+                color: #ccc;
+                max-height: 400px;
+                overflow-y: auto;
+            }
+
+            .nf-dialog-body label {
+                display: block;
+                margin-bottom: 8px;
+            }
+
+            .nf-dialog-body select {
+                width: 100%;
+                padding: 8px;
+                background: #1e1e1e;
+                border: 1px solid #555;
+                border-radius: 4px;
+                color: #ddd;
+                font-size: 13px;
+            }
+
+            .nf-dialog-body select:focus {
+                outline: none;
+                border-color: #4CAF50;
+            }
+
+            .nf-dialog-footer {
+                padding: 12px 16px;
+                border-top: 1px solid #444;
+                display: flex;
+                justify-content: flex-end;
+                gap: 8px;
+            }
+
+            .nf-btn {
+                padding: 6px 16px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background: transparent;
+                color: #ddd;
+                cursor: pointer;
+                font-size: 13px;
+                transition: all 0.2s;
+            }
+
+            .nf-btn-cancel {
+                background: transparent;
+                color: #ddd;
+            }
+
+            .nf-btn-cancel:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-btn-ok {
+                background: transparent;
+                color: #ddd;
+                font-weight: bold;
+            }
+
+            .nf-btn-ok:hover {
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .nf-form-item {
+                margin-bottom: 16px;
+            }
+
+            .nf-form-item label {
+                display: block;
+                margin-bottom: 6px;
+                font-size: 12px;
+                color: #aaa;
+            }
+
+            .nf-form-item input[type="text"] {
+                width: 100%;
+                padding: 8px;
+                background: #1e1e1e;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                color: #ddd;
+                font-size: 13px;
+                box-sizing: border-box;
+            }
+
+            .nf-form-item input[type="text"]:focus {
+                outline: none;
+                border-color: transparent;
+            }
+        `;
+    }
+
+    createPanel() {
+        if (document.getElementById("node-favorites-panel")) {
+            this.panel = document.getElementById("node-favorites-panel");
+            this.searchInput = this.panel.querySelector("#nf-search-input");
+            this.favoritesList = this.panel.querySelector("#nf-favorites-list");
+            this.categoryList = this.panel.querySelector("#nf-category-list");
+            this.notesTextarea = this.panel.querySelector("#nf-notes-textarea");
+            this.notesCount = this.panel.querySelector("#nf-notes-count");
+            this.currentTab = "favorites";
+            this.bindPanelEvents();
+            this.bindTabEvents();
+            this.bindNotesEvents();
+            this.loadNotes();
+            this.renderCategories();
+            this.renderFavorites();
+            return;
+        }
+
+        const panel = document.createElement("div");
+        panel.id = "node-favorites-panel";
+        panel.className = "node-favorites-panel collapsed";
+        const savedWidth = localStorage.getItem("rui.PanelWidth");
+        if (savedWidth) panel.style.width = savedWidth + "px";
+        panel.style.userSelect = "none";
+
+        panel.innerHTML = `
+            <div class="nf-panel-resizer" title="${ruiT('拖动调节宽度','Drag to resize width')}"></div>
+            <div class="nf-panel-bottom-resizer" title="${ruiT('拖动调节高度','Drag to resize height')}"></div>
+            <div class="nf-header" title="${ruiT('拖拽标题栏可移动窗口','Drag the title bar to move window')}">
+                <span class="nf-title">⭐ ${ruiT('Rui收藏','Rui Favorites')}</span>
+                <div class="nf-header-btns">
+                    <button class="nf-header-btn nf-settings-btn" id="nf-settings-btn" title="${ruiT('设置（使用频率配色）','Settings (usage frequency colors)')}">${ruiT('设置','Settings')}</button>
+                    <button class="nf-header-btn nf-shortcut-display" id="nf-shortcut-btn"></button>
+                    <button class="nf-toggle-btn" id="nf-toggle-btn">−</button>
+                </div>
+            </div>
+            <div class="nf-content" id="nf-content" style="display: none;">
+                <div class="nf-tab-bar">
+                    <div class="nf-tab-btn active" data-tab="favorites">⭐ ${ruiT('收藏','Favorites')}</div>
+                    <div class="nf-tab-btn" data-tab="notes">📝 ${ruiT('备注','Notes')}</div>
+                </div>
+                <div class="nf-tab-content" id="nf-tab-favorites">
+                    <div class="nf-search-box">
+                        <input type="text" id="nf-search-input" placeholder="🔍 ${ruiT('搜索收藏的节点...','Search favorited nodes...')}" />
+                        <button class="nf-clear-btn" id="nf-clear-btn" title="${ruiT('清除搜索','Clear search')}" style="display: none;">✕</button>
+                    </div>
+                    <div class="nf-split-container">
+                        <div class="nf-left-col">
+                            <div class="nf-categories-header">
+                                <span>${ruiT('分类','Categories')}</span>
+                                <button class="nf-add-cat-btn" id="nf-add-cat-btn" title="${ruiT('新建分类','New category')}">+</button>
+                            </div>
+                            <div class="nf-category-list" id="nf-category-list"></div>
+                        </div>
+                        <div class="nf-split-handle" id="nf-split-handle"></div>
+                        <div class="nf-right-col">
+                            <div class="nf-favorites-header">
+                                <div class="nf-fav-header-left">
+                                    <span>${ruiT('收藏节点','Favorite Nodes')}</span>
+                                    <span class="nf-count" id="nf-count">0</span>
+                                    <button class="nf-clear-invalid-btn" id="nf-clear-invalid-btn" style="display:none;" title="${ruiT('清理所有失效节点','Clear all invalid nodes')}">🧹 ${ruiT('清理失效','Clear invalid')}</button>
+                                </div>
+                                <div class="nf-sort-btns">
+                                    <button class="nf-sort-btn active" id="nf-sort-default" title="${ruiT('按使用频率排序','Sort by usage frequency')}">🔥</button>
+                                    <button class="nf-sort-btn" id="nf-sort-time" title="${ruiT('按最近使用排序','Sort by recent use')}">🕐</button>
+                                </div>
+                            </div>
+                            <div class="nf-favorites-list" id="nf-favorites-list">
+                                <div class="nf-empty-tip">${ruiT('暂无收藏节点','No favorited nodes yet')}<br/>${ruiT('右键节点选择"收藏节点"','Right-click a node and choose "Favorite Node"')}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="nf-tab-content" id="nf-tab-notes" style="display: none;">
+                    <div class="nf-notes-header">
+                        <span>📝 ${ruiT('记事本','Notepad')}</span>
+                        <span class="nf-notes-count" id="nf-notes-count">${ruiT('0 字','0 chars')}</span>
+                    </div>
+                    <div class="nf-notes-tab-bar" id="nf-notes-tab-bar">
+                        <div class="nf-notes-tab-scroll" id="nf-notes-tab-scroll"></div>
+                        <button type="button" class="nf-notes-tab-add" id="nf-notes-tab-add" title="${ruiT('新建分组','New group')}">＋</button>
+                    </div>
+                    <textarea class="nf-notes-textarea" id="nf-notes-textarea" placeholder="${ruiT('在这里记录笔记...&#10;&#10;内容会自动保存，刷新不丢失。&#10;提示：双击分组名重命名，右键分组可删除。','Record notes here...&#10;&#10;Auto-saved, persists after refresh.&#10;Tip: double-click a tab to rename, right-click to delete.')}"></textarea>
+                </div>
+            </div>
+        `;
+
+        const menu = document.querySelector(".comfy-menu");
+        if (menu && menu.parentNode) {
+            menu.parentNode.insertBefore(panel, menu.nextSibling);
+        } else {
+            const graphCanvas = document.querySelector(".litegraph");
+            if (graphCanvas && graphCanvas.parentNode) {
+                graphCanvas.parentNode.appendChild(panel);
+            } else {
+                document.body.appendChild(panel);
+            }
+        }
+
+        this.panel = panel;
+        this.searchInput = panel.querySelector("#nf-search-input");
+        this.favoritesList = panel.querySelector("#nf-favorites-list");
+        this.categoryList = panel.querySelector("#nf-category-list");
+        this.notesTextarea = panel.querySelector("#nf-notes-textarea");
+        this.notesCount = panel.querySelector("#nf-notes-count");
+        this.notesTabBar = panel.querySelector("#nf-notes-tab-bar");
+        this.currentTab = "favorites";
+        this._notesSaveTimer = null;
+        // 多标签分组：{ groups: [{id, name, content, color, order}], activeId }
+        this.notesData = null;
+        this._notesActiveId = null;
+
+        this.bindPanelEvents();
+        this.bindTabEvents();
+        this.bindNotesEvents();
+        this.loadNotes();
+        this.renderCategories();
+        this.applyActiveBarColor(this.favorites.activeBarColor);
+        this.renderFavorites();
+        this.loadPanelPosition();
+    }
+
+    bindPanelEvents() {
+        if (!this.panel) return;
+
+        this.setupCanvasAutoCollapse();   // 点击空白画布自动折叠收藏面板
+        this.setupDragging();
+        this.setupSplitResizing();
+        this.setupResizing();
+        this.setupBottomResizing();
+
+        const toggleBtn = this.panel.querySelector("#nf-toggle-btn");
+
+        if (toggleBtn) {
+            toggleBtn.addEventListener("click", () => {
+                this.collapsePanel();
+            });
+        }
+
+        if (this.searchInput) {
+            this.searchInput.addEventListener("input", (e) => {
+                this.currentSearch = e.target.value.replace(/\s/g, '').toLowerCase();
+                this.renderFavorites();
+                this.updateClearButtonVisibility();
+            });
+        }
+
+        const clearBtn = this.panel.querySelector("#nf-clear-btn");
+        if (clearBtn) {
+            clearBtn.addEventListener("click", () => {
+                this.searchInput.value = "";
+                this.currentSearch = "";
+                this.renderFavorites();
+                this.updateClearButtonVisibility();
+                this.searchInput.focus();
+            });
+        }
+
+        const addCatBtn = this.panel.querySelector("#nf-add-cat-btn");
+        if (addCatBtn) {
+            addCatBtn.addEventListener("click", () => {
+                this.showAddCategoryDialog();
+            });
+        }
+
+        const shortcutBtn = this.panel.querySelector("#nf-shortcut-btn");
+        if (shortcutBtn) {
+            shortcutBtn.addEventListener("click", () => {
+                this.showShortcutDialog();
+            });
+        }
+
+        const settingsBtn = this.panel.querySelector("#nf-settings-btn");
+        if (settingsBtn) {
+            settingsBtn.addEventListener("click", () => this.showSettingsDialog());
+        }
+
+        const sortDefaultBtn = this.panel.querySelector("#nf-sort-default");
+        const sortTimeBtn = this.panel.querySelector("#nf-sort-time");
+        if (sortDefaultBtn) {
+            sortDefaultBtn.addEventListener("click", () => {
+                this.setSortMode("default");
+            });
+            sortDefaultBtn.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                const hasData = this.favorites.nodes.some(n => (n.useCount || 0) > 0);
+                if (!hasData) return;
+                if (confirm(ruiT('确定清空所有收藏节点的使用频率记录吗？','Clear all favorite nodes usage frequency records?'))){
+                    this.favorites.nodes.forEach(n => n.useCount = 0);
+                    this.saveFavorites();
+                    this.renderFavorites();
+                }
+            });
+        }
+        if (sortTimeBtn) {
+            sortTimeBtn.addEventListener("click", () => {
+                this.setSortMode("time");
+            });
+        }
+
+        // 清理失效节点按钮
+        const clearInvalidBtn = this.panel.querySelector("#nf-clear-invalid-btn");
+        if (clearInvalidBtn) {
+            clearInvalidBtn.addEventListener("click", () => {
+                const count = this.getInvalidFavorites().length;
+                if (count === 0) return;
+                if (confirm(ruiT('确定要清理 ','Sure to clean up ') + count + ruiT(' 个失效的收藏节点吗？\n（这些节点对应的插件可能已卸载）',' invalid favorite nodes?\n(The corresponding plugin may have been uninstalled)'))){
+                    const removed = this.removeInvalidFavorites();
+                    alert(ruiT('已清理 ','Cleaned ') + removed + ruiT(' 个失效节点',' invalid nodes'));
+                }
+            });
+        }
+
+        this.updateShortcutDisplay();
+        this.updateSortButtons();
+    }
+
+    bindTabEvents() {
+        if (!this.panel) return;
+        const self = this;
+        const tabBtns = this.panel.querySelectorAll(".nf-tab-btn");
+        tabBtns.forEach(btn => {
+            btn.addEventListener("click", () => {
+                const tab = btn.dataset.tab;
+                self.switchTab(tab);
+            });
+        });
+    }
+
+    switchTab(tab) {
+        if (!this.panel) return;
+        this.currentTab = tab;
+        const tabBtns = this.panel.querySelectorAll(".nf-tab-btn");
+        tabBtns.forEach(btn => {
+            btn.classList.toggle("active", btn.dataset.tab === tab);
+        });
+        const favTab = this.panel.querySelector("#nf-tab-favorites");
+        const notesTab = this.panel.querySelector("#nf-tab-notes");
+        if (favTab) favTab.style.display = tab === "favorites" ? "" : "none";
+        if (notesTab) notesTab.style.display = tab === "notes" ? "" : "none";
+    }
+
+    bindNotesEvents() {
+        if (!this.notesTextarea) return;
+        const self = this;
+        this.notesTextarea.addEventListener("input", () => {
+            // 将改动同步到当前激活的分组
+            if (self._notesActiveId && self.notesData) {
+                const g = self.notesData.groups.find(x => x.id === self._notesActiveId);
+                if (g) g.content = self.notesTextarea.value;
+            }
+            self.updateNotesCount();
+            self.scheduleSaveNotes();
+        });
+
+        // 新建分组按钮
+        const addBtn = this.panel?.querySelector("#nf-notes-tab-add");
+        if (addBtn) {
+            addBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                self.addNotesGroup();
+            });
+        }
+    }
+
+    /** 生成分组标签条 */
+    renderNotesTabs() {
+        const scroll = this.panel?.querySelector("#nf-notes-tab-scroll");
+        if (!scroll || !this.notesData) return;
+        const self = this;
+        const groups = [...this.notesData.groups].sort((a, b) => (a.order || 0) - (b.order || 0));
+        let html = "";
+        for (const g of groups) {
+            const isActive = g.id === this._notesActiveId;
+            html += `
+                <div class="nf-notes-tab-item${isActive ? ' active' : ''}" data-nid="${g.id}">
+                    <span class="nf-notes-tab-dot" style="background:${g.color || '#4CAF50'};"></span>
+                    <span class="nf-notes-tab-name" data-nid="${g.id}" title="${(g.name||'').replace(/"/g,'&quot;')}">${g.name || '未命名'}</span>
+                    <span class="nf-notes-tab-del" data-nid="${g.id}" title="${ruiT('删除分组','Delete group')}">✕</span>
+                </div>
+            `;
+        }
+        scroll.innerHTML = html;
+
+        // 绑定事件
+        scroll.querySelectorAll(".nf-notes-tab-item").forEach(item => {
+            const nid = item.dataset.nid;
+            // 点击切换
+            item.addEventListener("click", (e) => {
+                if (e.target.classList.contains("nf-notes-tab-del")) return;
+                if (e.target.classList.contains("nf-notes-tab-name") && e.target.isContentEditable) return;
+                self.switchNotesGroup(nid);
+            });
+            // 右键菜单：删除
+            item.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                self.showNotesGroupContextMenu(e.clientX, e.clientY, nid);
+            });
+        });
+
+        // 删除按钮
+        scroll.querySelectorAll(".nf-notes-tab-del").forEach(btn => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                self.deleteNotesGroup(btn.dataset.nid);
+            });
+        });
+
+        // 双击重命名
+        scroll.querySelectorAll(".nf-notes-tab-name").forEach(nameEl => {
+            nameEl.addEventListener("dblclick", (e) => {
+                e.stopPropagation();
+                const nid = nameEl.dataset.nid;
+                self.startRenameNotesGroup(nid, nameEl);
+            });
+            // 左键点击颜色圆点：循环换色
+        });
+
+        // 圆点：点击切换颜色
+        scroll.querySelectorAll(".nf-notes-tab-dot").forEach(dot => {
+            dot.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const item = dot.closest(".nf-notes-tab-item");
+                if (!item) return;
+                self.cycleNotesGroupColor(item.dataset.nid);
+            });
+            dot.title = ruiT("点击更换颜色","Click to change color");
+            dot.style.cursor = "pointer";
+        });
+    }
+
+    /** 预设分组颜色（与前面主题色保持一致：红/黄/绿/青 + 若干） */
+    _notesGroupColors() {
+        return ["#FF5252", "#FFD700", "#4CAF50", "#00BCD4", "#FF9800", "#E91E63", "#9C27B0", "#2196F3", "#795548", "#607D8B"];
+    }
+
+    /** 循环切换分组颜色（每次调用取下一个） */
+    cycleNotesGroupColor(nid) {
+        if (!this.notesData) return;
+        const g = this.notesData.groups.find(x => x.id === nid);
+        if (!g) return;
+        const palette = this._notesGroupColors();
+        const cur = g.color || palette[0];
+        const idx = palette.indexOf(cur);
+        g.color = palette[(idx + 1) % palette.length] || palette[0];
+        this.saveNotes();
+        this.renderNotesTabs();
+    }
+
+    /** 切换到指定分组（先保存当前内容） */
+    switchNotesGroup(nid) {
+        if (!this.notesData) return;
+        const target = this.notesData.groups.find(x => x.id === nid);
+        if (!target || target.id === this._notesActiveId) return;
+
+        // 先把当前textarea内容写回旧分组
+        if (this._notesActiveId && this.notesTextarea) {
+            const oldG = this.notesData.groups.find(x => x.id === this._notesActiveId);
+            if (oldG) oldG.content = this.notesTextarea.value;
+        }
+
+        this._notesActiveId = nid;
+        this.notesData.activeId = nid;
+        if (this.notesTextarea) this.notesTextarea.value = target.content || "";
+        this.updateNotesCount();
+        this.renderNotesTabs();
+        this.saveNotes();
+    }
+
+    /** 新建分组 */
+    addNotesGroup() {
+        if (!this.notesData) this._initNotesDataDefault();
+        const palette = this._notesGroupColors();
+        const maxOrder = this.notesData.groups.reduce((m, g) => Math.max(m, g.order || 0), 0);
+        const existCount = this.notesData.groups.length;
+        const newId = "rui_nt_" + Date.now() + "_" + Math.floor(Math.random() * 10000);
+        const newGroup = {
+            id: newId,
+            name: ruiT("分组", "Group") + (existCount + 1),
+            content: "",
+            color: palette[existCount % palette.length],
+            order: maxOrder + 1,
+        };
+        this.notesData.groups.push(newGroup);
+
+        // 切到新分组（先保存旧内容）
+        if (this._notesActiveId && this.notesTextarea) {
+            const oldG = this.notesData.groups.find(x => x.id === this._notesActiveId);
+            if (oldG) oldG.content = this.notesTextarea.value;
+        }
+        this._notesActiveId = newId;
+        this.notesData.activeId = newId;
+        if (this.notesTextarea) this.notesTextarea.value = "";
+        this.updateNotesCount();
+        this.renderNotesTabs();
+        this.saveNotes();
+    }
+
+    /** 删除分组（最后一个分组不允许删） */
+    deleteNotesGroup(nid) {
+        if (!this.notesData || this.notesData.groups.length <= 1) return;
+        const idx = this.notesData.groups.findIndex(x => x.id === nid);
+        if (idx < 0) return;
+        const g = this.notesData.groups[idx];
+        const name = g.name || "分组";
+        const ok = confirm(ruiT(`确定删除「${name}」分组？\n该分组的内容将一并删除。`, `Delete group "${name}"?\nAll its content will be deleted.`));
+        if (!ok) return;
+
+        this.notesData.groups.splice(idx, 1);
+
+        // 如果删的是当前激活分组，切到第一个
+        if (this._notesActiveId === nid) {
+            const fallback = this.notesData.groups[0];
+            this._notesActiveId = fallback.id;
+            this.notesData.activeId = fallback.id;
+            if (this.notesTextarea) this.notesTextarea.value = fallback.content || "";
+            this.updateNotesCount();
+        } else {
+            this.notesData.activeId = this._notesActiveId;
+        }
+        this.renderNotesTabs();
+        this.saveNotes();
+    }
+
+    /** 双击进入重命名 */
+    startRenameNotesGroup(nid, nameEl) {
+        if (!nameEl || nameEl.isContentEditable) return;
+        const self = this;
+        const g = self.notesData?.groups.find(x => x.id === nid);
+        if (!g) return;
+
+        nameEl.setAttribute("contenteditable", "true");
+        nameEl.textContent = g.name || "";
+        nameEl.focus();
+        // 选中全部文字
+        try {
+            const range = document.createRange();
+            range.selectNodeContents(nameEl);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+        } catch (_) {}
+
+        const finish = (commit) => {
+            nameEl.removeAttribute("contenteditable");
+            if (commit) {
+                const newName = (nameEl.textContent || "").trim() || ruiT("未命名","Untitled");
+                g.name = newName;
+                nameEl.textContent = newName;
+                self.saveNotes();
+                self.renderNotesTabs();
+            } else {
+                // 还原
+                nameEl.textContent = g.name || ruiT("未命名","Untitled");
+            }
+            nameEl.removeEventListener("blur", onBlur);
+            nameEl.removeEventListener("keydown", onKey);
+        };
+        const onBlur = () => finish(true);
+        const onKey = (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                nameEl.blur();
+            } else if (e.key === "Escape") {
+                e.preventDefault();
+                finish(false);
+            }
+        };
+        nameEl.addEventListener("blur", onBlur);
+        nameEl.addEventListener("keydown", onKey);
+    }
+
+    /** 右键分组菜单 */
+    showNotesGroupContextMenu(x, y, nid) {
+        if (!this.notesData) return;
+        const g = this.notesData.groups.find(x => x.id === nid);
+        if (!g) return;
+        const self = this;
+
+        const existing = document.getElementById("nf-notes-group-ctx");
+        if (existing) existing.remove();
+
+        const menu = document.createElement("div");
+        menu.id = "nf-notes-group-ctx";
+        menu.style.cssText = `position:fixed;left:${x}px;top:${y}px;z-index:99999;background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:4px 0;min-width:140px;box-shadow:0 4px 12px rgba(0,0,0,0.5);user-select:none;`;
+        const items = [
+            { label: ruiT("重命名","Rename"), icon: "✏️", click: () => {
+                const tabScroll = self.panel?.querySelector("#nf-notes-tab-scroll");
+                const nameEl = tabScroll?.querySelector(`.nf-notes-tab-name[data-nid="${nid}"]`);
+                if (nameEl) self.startRenameNotesGroup(nid, nameEl);
+            }},
+            { label: ruiT("更换颜色","Change color"), icon: "🎨", click: () => self.cycleNotesGroupColor(nid) },
+            { label: ruiT("新建分组","New group"), icon: "➕", click: () => self.addNotesGroup() },
+        ];
+        if (self.notesData.groups.length > 1) {
+            items.push({ sep: true });
+            items.push({ label: ruiT("删除分组","Delete group"), icon: "🗑️", danger: true, click: () => self.deleteNotesGroup(nid) });
+        }
+        let html = "";
+        for (const it of items) {
+            if (it.sep) {
+                html += `<div style="height:1px;background:#3a3a3a;margin:4px 0;"></div>`;
+            } else {
+                html += `<div data-act="${it.label}" style="display:flex;align-items:center;gap:8px;padding:6px 12px;font-size:12px;cursor:pointer;${it.danger ? 'color:#FF5252;' : 'color:#ddd;'}">
+                    <span>${it.icon || ''}</span>
+                    <span>${it.label}</span>
+                </div>`;
+            }
+        }
+        menu.innerHTML = html;
+        document.body.appendChild(menu);
+
+        menu.querySelectorAll("[data-act]").forEach(row => {
+            const act = row.dataset.act;
+            const meta = items.find(i => i.label === act);
+            row.addEventListener("mouseenter", () => { row.style.background = "#3a3a3a"; });
+            row.addEventListener("mouseleave", () => { row.style.background = ""; });
+            row.addEventListener("click", (e) => {
+                e.stopPropagation();
+                menu.remove();
+                meta?.click?.();
+            });
+        });
+
+        setTimeout(() => {
+            const close = (e) => {
+                if (!menu.contains(e.target)) {
+                    menu.remove();
+                    document.removeEventListener("mousedown", close);
+                }
+            };
+            document.addEventListener("mousedown", close);
+        }, 0);
+    }
+
+    /** 初始化默认的多标签分组结构 */
+    _initNotesDataDefault() {
+        const palette = this._notesGroupColors();
+        const id = "rui_nt_default";
+        this.notesData = {
+            groups: [{ id, name: ruiT("默认笔记","Default Notes"), content: "", color: palette[0], order: 0 }],
+            activeId: id,
+        };
+        this._notesActiveId = id;
+    }
+
+    updateNotesCount() {
+        if (!this.notesTextarea || !this.notesCount) return;
+        const text = this.notesTextarea.value;
+        const count = text.length;
+        this.notesCount.textContent = count + ruiT(' 字',' chars');
+    }
+
+    scheduleSaveNotes() {
+        if (this._notesSaveTimer) clearTimeout(this._notesSaveTimer);
+        const self = this;
+        this._notesSaveTimer = setTimeout(() => {
+            self.saveNotes();
+        }, 500);
+    }
+
+    loadNotes() {
+        if (!this.notesTextarea) return;
+        try {
+            // 先尝试新结构
+            const raw = localStorage.getItem("rui.notes");
+            let migrated = false;
+            if (raw !== null) {
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && Array.isArray(parsed.groups) && typeof parsed.groups[0] === "object") {
+                        // 新结构
+                        this.notesData = parsed;
+                        const active = parsed.activeId && parsed.groups.find(g => g.id === parsed.activeId)
+                            ? parsed.activeId
+                            : parsed.groups[0].id;
+                        this._notesActiveId = active;
+                        this.notesData.activeId = active;
+                    } else {
+                        // 不是合法新结构，走字符串回退
+                        throw new Error("legacy string format");
+                    }
+                } catch (_) {
+                    // 旧结构：单字符串文本 → 迁移到"默认笔记"分组
+                    this._initNotesDataDefault();
+                    this.notesData.groups[0].content = (typeof raw === "string") ? raw : "";
+                    this._notesActiveId = this.notesData.groups[0].id;
+                    migrated = true;
+                }
+            } else {
+                // 没有数据 → 初始化一个默认分组
+                this._initNotesDataDefault();
+            }
+
+            // 写回 textarea
+            const g = this.notesData.groups.find(x => x.id === this._notesActiveId);
+            this.notesTextarea.value = g ? (g.content || "") : "";
+            this.updateNotesCount();
+            this.renderNotesTabs();
+            if (migrated) this.saveNotes();
+        } catch (e) {
+            console.warn("[Rui] 加载备注失败:", e);
+        }
+    }
+
+    saveNotes() {
+        if (!this.notesTextarea || !this.notesData) return;
+        try {
+            // 写回当前激活分组内容，确保最新
+            if (this._notesActiveId) {
+                const g = this.notesData.groups.find(x => x.id === this._notesActiveId);
+                if (g) g.content = this.notesTextarea.value;
+            }
+            this.notesData.activeId = this._notesActiveId;
+            localStorage.setItem("rui.notes", JSON.stringify(this.notesData));
+        } catch (e) {
+            console.warn("[Rui] 保存备注失败:", e);
+        }
+    }
+
+    setupDragging() {
+        if (!this.panel) return;
+
+        const header = this.panel.querySelector(".nf-header");
+        if (!header) return;
+
+        let isDragging = false;
+        let startX, startY, startLeft, startTop;
+
+        const startDrag = (e) => {
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+
+            const rect = this.panel.getBoundingClientRect();
+            startLeft = rect.left;
+            startTop = rect.top;
+
+            this.panel.style.transition = "none";
+            this.panel.style.zIndex = "9999";
+        };
+
+        header.addEventListener("mousedown", (e) => {
+            if (e.target.tagName === "BUTTON") return;
+            startDrag(e);
+        });
+
+        document.addEventListener("mousemove", (e) => {
+            if (!isDragging) return;
+
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+
+            let newLeft = startLeft + dx;
+            let newTop = startTop + dy;
+
+            const maxLeft = window.innerWidth - this.panel.offsetWidth;
+            const maxTop = window.innerHeight - this.panel.offsetHeight;
+            newLeft = Math.max(0, Math.min(newLeft, maxLeft));
+            newTop = Math.max(0, Math.min(newTop, maxTop));
+
+            this.setPanelPosition(newLeft, newTop);
+        });
+
+        document.addEventListener("mouseup", () => {
+            if (isDragging) {
+                isDragging = false;
+                this.panel.style.transition = "";
+                this.panel.style.zIndex = "1000";
+                this.savePanelPosition();
+            }
+        });
+    }
+
+    setupResizing() {
+        if (!this.panel) return;
+        const handle = this.panel.querySelector(".nf-panel-resizer");
+        if (!handle) return;
+        if (this._resizingSetup) return;
+        this._resizingSetup = true;
+
+        let isResizing = false;
+        let startX = 0, startWidth = 0;
+
+        handle.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            isResizing = true;
+            startX = e.clientX;
+            startWidth = this.panel.offsetWidth;
+            handle.classList.add("dragging");
+            // 固定左边缘位置，使右边缘跟随鼠标
+            const rect = this.panel.getBoundingClientRect();
+            this.panel.style.left = rect.left + "px";
+            this.panel.style.right = "auto";
+            document.body.style.cursor = "ew-resize";
+            document.body.style.userSelect = "none";
+        });
+
+        document.addEventListener("mousemove", (e) => {
+            if (!isResizing) return;
+            const dx = e.clientX - startX;
+            const newWidth = Math.max(280, Math.min(800, startWidth + dx));
+            this.panel.style.width = newWidth + "px";
+        });
+
+        document.addEventListener("mouseup", () => {
+            if (isResizing) {
+                isResizing = false;
+                handle.classList.remove("dragging");
+                document.body.style.cursor = "";
+                document.body.style.userSelect = "";
+                localStorage.setItem("rui.PanelWidth", this.panel.offsetWidth);
+                this.savePanelPosition();
+            }
+        });
+    }
+
+    setupBottomResizing() {
+        if (!this.panel) return;
+        const handle = this.panel.querySelector(".nf-panel-bottom-resizer");
+        if (!handle) return;
+        if (this._bottomResizingSetup) return;
+        this._bottomResizingSetup = true;
+
+        const savedHeight = localStorage.getItem("rui.PanelHeight");
+        if (savedHeight) this.panel.style.height = savedHeight + "px";
+
+        let isResizing = false;
+        let startY = 0, startHeight = 0;
+
+        handle.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            isResizing = true;
+            startY = e.clientY;
+            startHeight = this.panel.offsetHeight;
+            handle.classList.add("dragging");
+            const rect = this.panel.getBoundingClientRect();
+            this.panel.style.top = rect.top + "px";
+            this.panel.style.bottom = "auto";
+            document.body.style.cursor = "ns-resize";
+            document.body.style.userSelect = "none";
+        });
+
+        document.addEventListener("mousemove", (e) => {
+            if (!isResizing) return;
+            const dy = e.clientY - startY;
+            const newHeight = Math.max(200, Math.min(window.innerHeight - 50, startHeight + dy));
+            this.panel.style.height = newHeight + "px";
+        });
+
+        document.addEventListener("mouseup", () => {
+            if (isResizing) {
+                isResizing = false;
+                handle.classList.remove("dragging");
+                document.body.style.cursor = "";
+                document.body.style.userSelect = "";
+                localStorage.setItem("rui.PanelHeight", this.panel.offsetHeight);
+                this.savePanelPosition();
+            }
+        });
+    }
+
+    setupSplitResizing() {
+        const handle = this.panel.querySelector("#nf-split-handle");
+        const leftCol = this.panel.querySelector(".nf-left-col");
+        if (!handle || !leftCol) return;
+
+        const saved = localStorage.getItem("rui.SplitWidth");
+        if (saved) leftCol.style.width = saved + "px";
+
+        let isSplitResizing = false;
+        let startX, startWidth;
+
+        handle.addEventListener("mousedown", (e) => {
+            isSplitResizing = true;
+            startX = e.clientX;
+            startWidth = leftCol.offsetWidth;
+            e.preventDefault();
+            e.stopPropagation();
+        });
+
+        document.addEventListener("mousemove", (e) => {
+            if (!isSplitResizing) return;
+            const dx = e.clientX - startX;
+            const newWidth = Math.max(80, Math.min(300, startWidth + dx));
+            leftCol.style.width = newWidth + "px";
+        });
+
+        document.addEventListener("mouseup", () => {
+            if (isSplitResizing) {
+                isSplitResizing = false;
+                localStorage.setItem("rui.SplitWidth", leftCol.offsetWidth);
+            }
+        });
+    }
+
+    setPanelPosition(left, top) {
+        if (!this.panel) return;
+        this.panel.style.setProperty('left', left + 'px', 'important');
+        this.panel.style.setProperty('top', top + 'px', 'important');
+        this.panel.style.setProperty('right', 'auto', 'important');
+        this.panel.style.setProperty('bottom', 'auto', 'important');
+    }
+
+    savePanelPosition() {
+        if (!this.panel) return;
+        const rect = this.panel.getBoundingClientRect();
+        localStorage.setItem("rui.PanelPos", JSON.stringify({
+            left: rect.left,
+            top: rect.top
+        }));
+    }
+
+    loadPanelPosition() {
+        try {
+            const stored = localStorage.getItem("rui.PanelPos");
+            if (stored) {
+                const pos = JSON.parse(stored);
+                this.setPanelPosition(pos.left, pos.top);
+            }
+        } catch (e) {}
+    }
+
+    updateShortcutDisplay() {
+        const display = this.panel?.querySelector("#nf-shortcut-btn");
+        if (!display) return;
+
+        const shortcut = this.getShortcut();
+        const parts = [];
+        if (shortcut.ctrl) parts.push("Ctrl");
+        if (shortcut.alt) parts.push("Alt");
+        if (shortcut.shift) parts.push("Shift");
+        parts.push(shortcut.key.toUpperCase());
+        display.textContent = ruiT('快捷键','Shortcut') + ": " + parts.join("+");
+    }
+
+    showShortcutDialog() {
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">${ruiT('设置快捷键','Set Shortcut')}</div>
+                <div class="nf-dialog-body">
+                    <p style="margin-bottom: 16px; color: #888; font-size: 12px; text-align: center;">${ruiT('请按下你想要的快捷键','Press the shortcut you want')}</p>
+                    <div style="text-align: center; margin-bottom: 16px;">
+                        <div id="nf-listen-display" style="
+                            padding: 16px 24px;
+                            background: #4CAF50;
+                            border: 2px solid #4CAF50;
+                            border-radius: 6px;
+                            color: #fff;
+                            font-size: 16px;
+                            font-weight: bold;
+                            min-width: 180px;
+                            display: inline-block;
+                        ">${ruiT('请按快捷键...','Press shortcut...')}</div>
+                    </div>
+                    <p style="text-align: center; color: #666; font-size: 11px;">${ruiT('按 Esc 取消','Press Esc to cancel')}</p>
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dialog-close">${ruiT('关闭','Close')}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+
+        const display = dialog.querySelector("#nf-listen-display");
+        let isListening = true;
+
+        const stopListening = () => {
+            isListening = false;
+        };
+
+        const handleKeyDown = (e) => {
+            if (!isListening) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (e.key === "Escape") {
+                return;
+            }
+
+            const key = e.key.toLowerCase();
+            if (key === "control" || key === "shift" || key === "alt" || key === "meta") {
+                return;
+            }
+
+            const shortcut = {
+                key: key,
+                ctrl: e.ctrlKey,
+                alt: e.altKey,
+                shift: e.shiftKey,
+                meta: e.metaKey
+            };
+
+            this.saveShortcut(shortcut);
+            this.updateShortcutDisplay();
+
+            const parts = [];
+            if (shortcut.ctrl) parts.push("Ctrl");
+            if (shortcut.alt) parts.push("Alt");
+            if (shortcut.shift) parts.push("Shift");
+            parts.push(shortcut.key.toUpperCase());
+
+            display.textContent = parts.join(" + ");
+            display.style.background = "#2a2a2a";
+            display.style.color = "#4CAF50";
+            stopListening();
+        };
+
+        document.addEventListener("keydown", handleKeyDown, true);
+
+        dialog.querySelector("#nf-dialog-close").addEventListener("click", () => {
+            document.removeEventListener("keydown", handleKeyDown, true);
+            dialog.remove();
+        });
+
+        dialog.addEventListener("click", (e) => {
+            if (e.target === dialog) {
+                document.removeEventListener("keydown", handleKeyDown, true);
+                dialog.remove();
+            }
+        });
+    }
+
+    expandPanel() {
+        if (!this.panel) return;
+
+        const rect = this.panel.getBoundingClientRect();
+        this._collapsedPos = { left: rect.left, top: rect.top };
+
+        this.panel.classList.remove("collapsed");
+        if (this._expandedWidth) {
+            this.panel.style.width = this._expandedWidth;
+        }
+        const content = this.panel.querySelector("#nf-content");
+        if (content) {
+            content.style.display = "flex";
+            content.style.flexDirection = "column";
+        }
+
+        if (this.searchInput) {
+            this.searchInput.value = "";
+            setTimeout(() => this.searchInput.focus(), 50);
+        }
+        this.currentSearch = "";
+        this.currentCategory = "all";
+        this.renderCategories();
+        this.renderFavorites();
+        this.updateClearButtonVisibility();
+
+        const panelW = this.panel.offsetWidth || 450;
+        const panelH = this.panel.offsetHeight || 400;
+
+        let left, top;
+        if (this._expandedPos) {
+            left = this._expandedPos.left;
+            top = this._expandedPos.top;
+        } else {
+            try {
+                const saved = localStorage.getItem("rui.PanelPos");
+                if (saved) {
+                    const pos = JSON.parse(saved);
+                    left = pos.left;
+                    top = pos.top;
+                } else {
+                    left = rect.left;
+                    top = rect.top;
+                }
+            } catch (e) {
+                left = rect.left;
+                top = rect.top;
+            }
+        }
+
+        if (left + panelW > window.innerWidth - 10) left = window.innerWidth - panelW - 10;
+        if (left < 10) left = 10;
+        if (top + panelH > window.innerHeight - 10) top = window.innerHeight - panelH - 10;
+        if (top < 10) top = 10;
+
+        this.setPanelPosition(left, top);
+    }
+
+    collapsePanel() {
+        if (!this.panel) return;
+        this._hidePreview(0);
+        const rect = this.panel.getBoundingClientRect();
+        this._expandedPos = { left: rect.left, top: rect.top };
+        this._expandedWidth = this.panel.style.width;
+        this.panel.style.width = "";
+        this.panel.classList.add("collapsed");
+        const content = this.panel.querySelector("#nf-content");
+        if (content) {
+            content.style.display = "none";
+        }
+        if (this._collapsedPos) {
+            this.setPanelPosition(this._collapsedPos.left, this._collapsedPos.top);
+        }
+
+        if (this._savedCollapsedPosition) {
+            this.setPanelPosition(this._savedCollapsedPosition.left, this._savedCollapsedPosition.top);
+            this.savePanelPosition();
+            this._savedCollapsedPosition = null;
+        }
+    }
+
+    /** 判断点击位置是否落在某个节点上（区分「空白画布」与「节点」） */
+    _isPointerOnNode(e) {
+        try {
+            const canvas = app.canvas;
+            if (!canvas || !canvas.getNodeAtPosition) return false;
+            let cx = e.canvasX ?? e._canvas_x;
+            let cy = e.canvasY ?? e._canvas_y;
+            if ((cx === undefined || cy === undefined) && canvas.convertEventToCanvasCoordinates) {
+                const p = canvas.convertEventToCanvasCoordinates(e);
+                if (p) { cx = p[0]; cy = p[1]; }
+            }
+            if (cx === undefined || cy === undefined) return false;
+            return !!canvas.getNodeAtPosition(cx, cy);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    /**
+     * 收藏面板（⭐Rui收藏）展开时，若点击「空白画布」（非节点、非面板内部），
+     * 则自动折叠收藏面板，与工作流管理面板行为一致。
+     * 点击节点或面板内部时放行。
+     */
+    setupCanvasAutoCollapse() {
+        if (this._canvasAutoCollapseInstalled) return;
+        this._canvasAutoCollapseInstalled = true;
+
+        const install = () => {
+            const canvasEl = app.canvas && app.canvas.canvas;
+            if (!canvasEl) {
+                setTimeout(install, 200);
+                return;
+            }
+
+            const onPointer = (e) => {
+                try {
+                    if (!this.panel || this.panel.classList.contains("collapsed")) return; // 已折叠不处理
+                    if (this.panel.contains(e.target)) return;        // 点击面板内部：放行（避免拖动/操作被误关）
+                    if (this._isPointerOnNode(e)) return;             // 点击节点：放行
+                    this.collapsePanel();                             // 空白画布：自动折叠
+                } catch (_) {}
+            };
+
+            canvasEl.addEventListener("pointerdown", onPointer, true);
+        };
+
+        install();
+    }
+
+    extendNodeMenu() {
+        if (this.nodeMenuExtended) return;
+        this.nodeMenuExtended = true;
+
+        const self = this;
+        const origGetNodeMenuOptions = LGraphCanvas.prototype.getNodeMenuOptions;
+
+        if (!origGetNodeMenuOptions) return;
+
+        LGraphCanvas.prototype.getNodeMenuOptions = function(node) {
+            const options = origGetNodeMenuOptions.apply(this, arguments);
+            if (!options || !Array.isArray(options)) return options;
+
+            // 多选时显示工作流收藏选项
+            const selectedNodes = this.selected_nodes;
+            const hasMultiple = selectedNodes && Object.keys(selectedNodes).length >= 2;
+
+            if (hasMultiple) {
+                const nodes = Object.values(selectedNodes);
+                const wfId = self.getWorkflowIdByNodes(nodes);
+                const count = nodes.length;
+                const wfOption = {
+                    content: wfId
+                        ? `<span style="color:#FFD700;">⭐ ${ruiT('取消收藏多节点','Unfavorite multiple nodes')} (${count}${ruiT('个节点',' nodes')})</span>`
+                        : `<span style="color:#FFD700;">🔗 ${ruiT('收藏多节点','Favorite multiple nodes')} (${count}${ruiT('个节点',' nodes')})</span>`,
+                    callback: () => {
+                        if (wfId) {
+                            self.removeFavoriteWorkflow(wfId);
+                        } else {
+                            self.saveSelectedAsWorkflow(nodes);
+                        }
+                    }
+                };
+                // 固定插入到倒数第三行
+                const insertPos = Math.max(0, options.length - 2);
+                options.splice(insertPos, 0, wfOption);
+            } else {
+                // 单节点收藏
+                const isFavorited = self.isNodeFavorited(node.type);
+                let favOption = {
+                    content: isFavorited ? `<span style="color:#FFD700;">⭐ ${ruiT('取消收藏','Unfavorite')}</span>` : `<span style="color:#FFD700;">☆ ${ruiT('收藏节点','Favorite Node')}</span>`,
+                    callback: () => {
+                        if (isFavorited) {
+                            self.removeFavorite(node.type);
+                        } else {
+                            self.showAddToCategoryDialog(node);
+                        }
+                    }
+                };
+                // 固定插入到倒数第三行
+                const insertPos = Math.max(0, options.length - 2);
+                options.splice(insertPos, 0, favOption);
+            }
+
+            return options;
+        };
+    }
+
+    extendCanvasMenu() {
+        if (this.canvasMenuExtended) return;
+        this.canvasMenuExtended = true;
+
+        const self = this;
+        const origGetCanvasMenuOptions = LGraphCanvas.prototype.getCanvasMenuOptions;
+
+        if (!origGetCanvasMenuOptions) return;
+
+        LGraphCanvas.prototype.getCanvasMenuOptions = function() {
+            const options = origGetCanvasMenuOptions.apply(this, arguments);
+            if (!options || !Array.isArray(options)) return options;
+
+            const selectedNodes = this.selected_nodes;
+            const hasMultiple = selectedNodes && Object.keys(selectedNodes).length >= 2;
+
+            if (hasMultiple) {
+                const nodes = Object.values(selectedNodes);
+                const wfId = self.getWorkflowIdByNodes(nodes);
+                const count = nodes.length;
+                const wfOption = {
+                    content: wfId
+                        ? `<span style="color:#FFD700;">⭐ ${ruiT('取消收藏工作流','Unfavorite workflow')} (${count}${ruiT('个节点',' nodes')})</span>`
+                        : `<span style="color:#FFD700;">🔗 ${ruiT('收藏多节点','Favorite multiple nodes')} (${count}${ruiT('个节点',' nodes')})</span>`,
+                    callback: () => {
+                        if (wfId) {
+                            self.removeFavoriteWorkflow(wfId);
+                        } else {
+                            self.saveSelectedAsWorkflow(nodes);
+                        }
+                    }
+                };
+                const sepIndex = options.findIndex(o => o === null);
+                if (sepIndex >= 0) {
+                    options.splice(sepIndex, 0, wfOption);
+                } else {
+                    options.push(null, wfOption);
+                }
+            }
+
+            const sc = self.getShortcut();
+            const scParts = [];
+            if (sc.ctrl) scParts.push("Ctrl");
+            if (sc.alt) scParts.push("Alt");
+            if (sc.shift) scParts.push("Shift");
+            scParts.push(sc.key.toUpperCase());
+            const ruiItem = {
+                content: `<span style="color:#FFD700;">⭐ ${ruiT('Rui收藏','Rui Favorites')}</span> <span style="color:#4CAF50;font-size:10px;">${ruiT('快捷键','Shortcut')}${scParts.join("+")}</span>`,
+                callback: () => {
+                    self.togglePanel();
+                }
+            };
+            options.splice(0, 0, ruiItem);
+
+            return options;
+        };
+    }
+
+    extendGroupMenu() {
+        // 不再需要单独的方法；功能已整合到 extendNodeMenu 和 extendCanvasMenu 中
+    }
+
+    togglePanel() {
+        if (!this.panel) return;
+        if (this.panel.classList.contains("collapsed")) {
+            this.expandPanel();
+        } else {
+            this.collapsePanel();
+        }
+    }
+
+    isNodeFavorited(nodeType) {
+        return this.favorites.nodes.some(n => n.type === nodeType);
+    }
+
+    async addFavorite(node, categoryId = "default") {
+        if (this.isNodeFavorited(node.type)) {
+            return;
+        }
+
+        const nodeDef = LiteGraph.registered_node_types[node.type];
+        const displayName = node.title || nodeDef?.title || node.type;
+        const category = nodeDef ? (nodeDef.category || "Unknown") : "Unknown";
+
+        const maxOrder = this.favorites.nodes
+            .filter(n => n.categoryId === categoryId)
+            .reduce((max, n) => Math.max(max, n.order || 0), 0);
+
+        this.favorites.nodes.push({
+            type: node.type,
+            displayName: displayName,
+            category: category,
+            categoryId: categoryId,
+            addedAt: Date.now(),
+            useCount: 0,
+            lastUsed: Date.now(),
+            order: maxOrder + 1000
+        });
+
+        this.saveFavorites();
+        this.renderFavorites();
+        this.renderCategories();
+
+        // 收藏时截图保存真实节点预览
+        const dataUrl = await this._captureNodeImage(node) || this._createPreviewPlaceholder(displayName);
+        await this._savePreviewImage(node.type, dataUrl);
+        // 清理旧 canvas 绘制缓存，确保悬浮时优先使用新截图
+        this._previewCanvasCache.delete(node.type);
+    }
+
+    async removeFavorite(nodeType) {
+        this.favorites.nodes = this.favorites.nodes.filter(n => n.type !== nodeType);
+        this.saveFavorites();
+        this.renderFavorites();
+        this.renderCategories();
+        this._previewCanvasCache.delete(nodeType);
+        await this._deletePreviewImage(nodeType);
+        // 取消收藏时，一并关闭该类型节点在画布上的辉光/彩虹装饰
+        this._clearNodeGlow(nodeType);
+    }
+
+    /** 关闭画布上指定类型节点的辉光(glow)/彩虹(rainbow)装饰，仅保留标题文字本身 */
+    _clearNodeGlow(nodeType) {
+        try {
+            const graph = app?.graph;
+            if (!graph || !graph._nodes) return;
+            let changed = false;
+            for (const node of graph._nodes) {
+                if (node.type === nodeType && node.properties) {
+                    if (node.properties.glowEnabled) {
+                        node.properties.glowEnabled = false;
+                        changed = true;
+                    }
+                    if (node.properties.rainbowEnabled) {
+                        node.properties.rainbowEnabled = false;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed && app?.canvas) app.canvas.setDirtyCanvas(true, true);
+        } catch (e) {
+            console.warn("[Rui] 清除辉光失败:", e);
+        }
+    }
+
+    // ====== 多节点收藏 ======
+
+    getWorkflowIdByNodes(selectedNodes) {
+        if (!selectedNodes || selectedNodes.length < 2) return null;
+        const typeIds = selectedNodes.map(n => n.type).sort().join(",");
+        return this.favorites.workflows.find(w => w._typeSignature === typeIds)?.id || null;
+    }
+
+    saveSelectedAsWorkflow(selectedNodes) {
+        try {
+            const graph = app.graph;
+            if (!graph) {
+                console.warn("[Rui] 工作流收藏失败：graph 不可用");
+                return;
+            }
+            const nodeIds = new Set(selectedNodes.map(n => n.id));
+
+            // 序列化节点数据（安全深拷贝，避免循环引用或非序列化对象）
+            const safeClone = (obj) => {
+                try {
+                    return JSON.parse(JSON.stringify(obj));
+                } catch (e) {
+                    return null;
+                }
+            };
+
+            const nodesData = selectedNodes.map(n => {
+                const ser = {};
+                ser.id = n.id;
+                ser.type = n.type;
+                ser.pos = n.pos ? [...n.pos] : [0, 0];
+                ser.size = n.size ? [...n.size] : [200, 80];
+                ser.flags = n.flags ? { ...n.flags } : {};
+                ser.order = n.order || 0;
+                ser.mode = n.mode != null ? n.mode : 0;
+                ser.properties = n.properties ? safeClone(n.properties) || {} : {};
+                ser.widgets_values = n.widgets_values ? safeClone(n.widgets_values) || [] : [];
+                // 保存 inputs/outputs 结构用于恢复连线
+                ser.inputs = n.inputs ? n.inputs.map(inp => ({
+                    name: inp.name,
+                    type: inp.type
+                })) : [];
+                ser.outputs = n.outputs ? n.outputs.map(out => ({
+                    name: out.name,
+                    type: out.type
+                })) : [];
+                return ser;
+            });
+
+            // 提取选中节点之间的连线
+            const linksData = [];
+            // 兼容 Map（新版）和 Array（旧版）
+            const linksIterable = graph._links instanceof Map
+                ? graph._links.values()
+                : (graph.links instanceof Map ? graph.links.values() : graph.links);
+            if (linksIterable) {
+                for (const link of linksIterable) {
+                    if (!link) continue;
+                    if (nodeIds.has(link.origin_id) && nodeIds.has(link.target_id)) {
+                        linksData.push({
+                            origin_id: link.origin_id,
+                            origin_slot: link.origin_slot,
+                            target_id: link.target_id,
+                            target_slot: link.target_slot,
+                            type: link.type
+                        });
+                    }
+                }
+            }
+
+            // 计算中心偏移
+            let minX = Infinity, minY = Infinity;
+            for (const n of nodesData) {
+                if (n.pos[0] < minX) minX = n.pos[0];
+                if (n.pos[1] < minY) minY = n.pos[1];
+            }
+
+            // 生成名称
+            const typeNames = selectedNodes.map(n => {
+                const def = LiteGraph.registered_node_types[n.type];
+                return def ? (def.title || n.type) : n.type;
+            });
+            const rawName = typeNames.slice(0, 3).join(" + ") + (typeNames.length > 3 ? `...` : ``);
+            // 转义 HTML 特殊字符，避免破坏对话框结构
+            const escapeHtml = (s) => String(s)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+            const name = escapeHtml(rawName);
+
+            const typeSignature = selectedNodes.map(n => n.type).sort().join(",");
+
+            this.showWorkflowCategoryDialog({ nodesData, linksData, name, typeSignature, minX, minY, rawName, selectedNodes });
+        } catch (e) {
+            console.error("[Rui] 收藏多节点失败:", e);
+            alert(ruiT('收藏多节点失败：','Failed to favorite multiple nodes: ') + e.message);
+        }
+    }
+
+    showWorkflowCategoryDialog(data) {
+        const cats = this.favorites.categories;
+        const escapeHtml = (s) => String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+        let optionsHTML = "";
+        for (const cat of cats) {
+            optionsHTML += `<option value="${escapeHtml(cat.id)}">${escapeHtml(cat.name)}</option>`;
+        }
+
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">收藏多节点</div>
+                <div class="nf-dialog-body">
+                    <label>分类：</label>
+                    <select id="nf-cat-select" style="margin-bottom:10px;">${optionsHTML}</select>
+                    <label>名称：</label>
+                    <input type="text" id="nf-wf-name" value="${data.name}" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #555;border-radius:4px;color:#ddd;box-sizing:border-box;" />
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+
+        const self = this;
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => dialog.remove());
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", async () => {
+            try {
+                const nameInput = dialog.querySelector("#nf-wf-name");
+                const name = nameInput.value.trim() || (data.rawName || data.name);
+                const catId = dialog.querySelector("#nf-cat-select").value;
+                const id = "wf_" + Date.now();
+
+                self.favorites.workflows.push({
+                    id: id,
+                    name: name,
+                    categoryId: catId,
+                    nodesData: data.nodesData,
+                    linksData: data.linksData,
+                    _typeSignature: data.typeSignature,
+                    addedAt: Date.now(),
+                    useCount: 0,
+                    lastUsed: Date.now()
+                });
+
+                self.saveFavorites();
+                self.renderFavorites();
+                self.renderCategories();
+                dialog.remove();
+
+                // 异步保存截图预览
+                if (data.selectedNodes && data.selectedNodes.length > 0) {
+                    try {
+                        const dataUrl = await self._captureWorkflowImage(data.selectedNodes);
+                        if (dataUrl) {
+                            await self._savePreviewImage("wf_" + id, dataUrl);
+                        }
+                    } catch (_) {}
+                }
+            } catch (e) {
+                console.error("[Rui] 保存多节点收藏失败:", e);
+                alert(ruiT('保存失败：','Save failed: ') + e.message);
+            }
+        });
+
+        dialog.addEventListener("mousedown", (e) => {
+            if (e.target === dialog) dialog.remove();
+        });
+
+        // 回车提交
+        dialog.querySelector("#nf-wf-name").addEventListener("keydown", (e) => {
+            if (e.key === "Enter") dialog.querySelector("#nf-dlg-ok").click();
+        });
+    }
+
+    removeFavoriteWorkflow(id) {
+        this.favorites.workflows = this.favorites.workflows.filter(w => w.id !== id);
+        this.saveFavorites();
+        this.renderFavorites();
+        this.renderCategories();
+        this._deletePreviewImage("wf_" + id);
+    }
+
+    addWorkflowToCanvas(workflow, targetX = null, targetY = null) {
+        try {
+            const graph = app.graph;
+            const canvas = app.canvas;
+            if (!graph || !canvas) {
+                console.error("[Rui] 画布不可用");
+                return;
+            }
+
+            console.log("[Rui] 恢复工作流:", workflow.name, "节点数:", workflow.nodesData?.length);
+
+            // 计算放置中心
+            let cx, cy;
+            if (targetX != null && targetY != null) {
+                // 使用指定位置（拖拽释放时的鼠标位置）
+                cx = targetX;
+                cy = targetY;
+            } else {
+                // 默认为画布中心
+                try {
+                    const rect = canvas.canvas?.getBoundingClientRect?.();
+                    if (rect) {
+                        cx = rect.width / 2;
+                        cy = rect.height / 2;
+                    }
+                    const scale = canvas.ds?.scale || 1;
+                    const ox = canvas.ds?.offset?.[0] || 0;
+                    const oy = canvas.ds?.offset?.[1] || 0;
+                    cx = cx / scale - ox;
+                    cy = cy / scale - oy;
+                } catch (e) {
+                    const gNodes = graph._nodes?.filter?.(n => n.type) || [];
+                    if (gNodes.length > 0) {
+                        let sx = 0, sy = 0;
+                        for (const n of gNodes) { sx += n.pos[0]; sy += n.pos[1]; }
+                        cx = sx / gNodes.length + 100;
+                        cy = sy / gNodes.length + 100;
+                    } else {
+                        cx = 200;
+                        cy = 200;
+                    }
+                }
+            }
+
+            // 计算工作流的中心
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const nd of workflow.nodesData) {
+                const px = nd.pos?.[0] || 0;
+                const py = nd.pos?.[1] || 0;
+                const w = nd.size?.[0] || 200;
+                const h = nd.size?.[1] || 100;
+                if (px < minX) minX = px;
+                if (py < minY) minY = py;
+                if (px + w > maxX) maxX = px + w;
+                if (py + h > maxY) maxY = py + h;
+            }
+            const originCx = (minX + maxX) / 2;
+            const originCy = (minY + maxY) / 2;
+
+            // 创建节点
+            const idMap = {};
+            const nodeMap = {};
+            for (const nd of workflow.nodesData) {
+                const node = LiteGraph.createNode(nd.type);
+                if (!node) {
+                    console.warn("[Rui] 无法创建节点类型:", nd.type);
+                    continue;
+                }
+
+                // 分配新ID
+                let newId;
+                if (graph.getNextNodeId) {
+                    newId = graph.getNextNodeId();
+                } else {
+                    newId = graph._nodeIdCounter || 1;
+                    graph._nodeIdCounter = newId + 1;
+                }
+                idMap[nd.id] = newId;
+                nodeMap[nd.id] = node;
+                node.id = newId;
+
+                // 设置位置（相对偏移）
+                node.pos = [cx + (nd.pos[0] - originCx), cy + (nd.pos[1] - originCy)];
+
+                // 恢复节点状态
+                if (nd.size) node.size = [...nd.size];
+                if (nd.flags) Object.assign(node.flags, nd.flags);
+                if (nd.mode !== undefined) node.mode = nd.mode;
+                if (nd.properties) node.properties = JSON.parse(JSON.stringify(nd.properties));
+                if (nd.widgets_values) node.widgets_values = JSON.parse(JSON.stringify(nd.widgets_values));
+
+                // 添加到画布
+                graph.add(node);
+                if (typeof node.onAdded === 'function') node.onAdded();
+
+                // 恢复 widget 值
+                if (node.widgets && node.widgets_values) {
+                    for (let i = 0; i < node.widgets.length && i < node.widgets_values.length; i++) {
+                        if (node.widgets[i]) {
+                            node.widgets[i].value = node.widgets_values[i];
+                        }
+                    }
+                }
+            }
+
+            // 恢复连线
+            let linkCount = 0;
+            for (const ld of workflow.linksData) {
+                const srcNode = nodeMap[ld.origin_id];
+                const tgtNode = nodeMap[ld.target_id];
+                if (!srcNode || !tgtNode) continue;
+
+                try {
+                    const result = srcNode.connect(ld.origin_slot, tgtNode, ld.target_slot);
+                    if (result != null && result !== -1) linkCount++;
+                } catch (e) {
+                    console.warn("[Rui] 连线恢复失败:", e);
+                }
+            }
+
+            canvas.setDirty(true, true);
+            canvas.draw(true, true);
+            if (typeof app.graph.change === 'function') app.graph.change();
+
+            // 记录使用
+            const w = this.favorites.workflows.find(x => x.id === workflow.id);
+            if (w) {
+                w.useCount = (w.useCount || 0) + 1;
+                w.lastUsed = Date.now();
+                this.saveFavorites();
+                this.renderFavorites();
+            }
+
+            console.log(`[Rui] 工作流恢复完成: ${workflow.name} (${Object.keys(idMap).length}节点, ${linkCount}连线)`);
+        } catch (e) {
+            console.error("[Rui] 恢复工作流失败:", e);
+            console.error(e.stack);
+        }
+    }
+
+    addWorkflowToCanvasAt(wfId, canvasX, canvasY) {
+        const workflow = this.favorites.workflows.find(w => w.id === wfId);
+        if (!workflow) {
+            console.warn("[Rui] 找不到工作流:", wfId);
+            return;
+        }
+        this.addWorkflowToCanvas(workflow, canvasX, canvasY);
+    }
+
+    addWorkflowToCanvasById(wfId) {
+        const workflow = this.favorites.workflows.find(w => w.id === wfId);
+        if (!workflow) {
+            console.warn("[Rui] 找不到工作流:", wfId);
+            return;
+        }
+        this.addWorkflowToCanvas(workflow);
+    }
+
+    _adjustContextMenuPosition(menu) {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const rect = menu.getBoundingClientRect();
+        let left = rect.left;
+        let top = rect.top;
+        if (rect.right > vw - 4) {
+            left = vw - rect.width - 4;
+        }
+        if (rect.bottom > vh - 4) {
+            top = vh - rect.height - 4;
+        }
+        if (left < 4) left = 4;
+        if (top < 4) top = 4;
+        menu.style.left = left + "px";
+        menu.style.top = top + "px";
+    }
+
+    showWorkflowContextMenu(x, y, wfId, wfName) {
+        document.querySelectorAll(".nf-cat-context-menu").forEach(el => el.remove());
+
+        const wf = this.favorites.workflows.find(w => w.id === wfId);
+        const useCount = wf?.useCount || 0;
+
+        const menu = document.createElement("div");
+        menu.className = "nf-cat-context-menu";
+        menu.style.cssText = `position:fixed;left:${x}px;top:${y}px;z-index:99999;background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:4px 0;min-width:130px;box-shadow:0 4px 12px rgba(0,0,0,0.5);`;
+        menu.innerHTML = `
+            <div class="nf-cat-menu-item" data-action="move" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#FF9800;">📁</span> 修改分类
+            </div>
+            <div class="nf-cat-menu-item" data-action="rename" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#2196F3;">✏️</span> 重命名
+            </div>
+            <div class="nf-cat-menu-item" data-action="refresh-preview" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#4CAF50;">↻</span> ${ruiT('刷新缩略图','Refresh Thumbnail')}
+            </div>
+            <div class="nf-cat-menu-item" data-action="clear" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#FF5722;">🗑</span> 清空使用频率${useCount > 0 ? ` (${useCount}次)` : ''}
+            </div>
+            <div style="border-top:1px solid #444;margin:4px 0;"></div>
+            <div class="nf-cat-menu-item" data-action="delete" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#f44336;">×</span> 删除多节点收藏
+            </div>
+        `;
+
+        menu.querySelectorAll(".nf-cat-menu-item").forEach(el => {
+            el.addEventListener("mouseenter", () => el.style.background = "#3a3a3a");
+            el.addEventListener("mouseleave", () => el.style.background = "");
+            el.addEventListener("click", (e) => {
+                e.stopPropagation();
+                menu.remove();
+                if (el.dataset.action === "rename") {
+                    this.showRenameWorkflowDialog(wfId);
+                } else if (el.dataset.action === "move") {
+                    this.showMoveWorkflowCategoryDialog(wfId);
+                } else if (el.dataset.action === "clear") {
+                    if (useCount > 0 && confirm(ruiT('确定清空工作流','Clear workflow ') + `"${wfName}"` + ruiT('的使用频率记录吗？',' usage frequency records?'))){
+                        if (wf) { wf.useCount = 0; this.saveFavorites(); this.renderFavorites(); }
+                    }
+                } else if (el.dataset.action === "delete") {
+                    if (confirm(ruiT('确定要删除多节点收藏','Sure to delete multi-node favorite ') + `"${wfName}"` + ruiT('吗？','?'))){
+                        this.removeFavoriteWorkflow(wfId);
+                    }
+                }
+            });
+        });
+
+        document.body.appendChild(menu);
+        this._adjustContextMenuPosition(menu);
+
+        const closeMenu = (e) => {
+            if (!menu.contains(e.target)) {
+                menu.remove();
+                document.removeEventListener("click", closeMenu);
+                document.removeEventListener("contextmenu", closeMenu);
+            }
+        };
+        requestAnimationFrame(() => {
+            document.addEventListener("click", closeMenu);
+            document.addEventListener("contextmenu", closeMenu);
+        });
+    }
+
+    showMoveWorkflowCategoryDialog(wfId) {
+        const wf = this.favorites.workflows.find(w => w.id === wfId);
+        if (!wf) return;
+        const wfName = wf.name || "工作流";
+
+        const cats = this.favorites.categories;
+        let optionsHTML = "";
+        for (const cat of cats) {
+            const selected = cat.id === wf.categoryId ? "selected" : "";
+            optionsHTML += `<option value="${cat.id}" ${selected}>${cat.name}</option>`;
+        }
+
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">移动"${wfName}"到分类</div>
+                <div class="nf-dialog-body">
+                    <label>选择分类：</label>
+                    <select id="nf-cat-select">${optionsHTML}</select>
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => dialog.remove());
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", () => {
+            const catId = dialog.querySelector("#nf-cat-select").value;
+            wf.categoryId = catId;
+            this.saveFavorites();
+            this.renderFavorites();
+            this.renderCategories();
+            dialog.remove();
+        });
+        dialog.addEventListener("mousedown", (e) => { if (e.target === dialog) dialog.remove(); });
+    }
+
+    showRenameWorkflowDialog(wfId) {
+        const wf = this.favorites.workflows.find(w => w.id === wfId);
+        if (!wf) return;
+        const oldName = wf.name || "工作流";
+
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">重命名工作流</div>
+                <div class="nf-dialog-body">
+                    <label>新名称：</label>
+                    <input type="text" id="nf-wf-rename-input" value="${oldName.replace(/"/g, '&quot;')}" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #555;border-radius:4px;color:#ddd;margin-bottom:10px;box-sizing:border-box;" />
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(dialog);
+
+        const input = dialog.querySelector("#nf-wf-rename-input");
+        input.focus();
+        input.select();
+
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => dialog.remove());
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", () => {
+            const newName = input.value.trim();
+            if (!newName) { dialog.remove(); return; }
+            wf.name = newName;
+            this.saveFavorites();
+            this.renderFavorites();
+            this.renderCategories();
+            dialog.remove();
+        });
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") dialog.querySelector("#nf-dlg-ok").click();
+            if (e.key === "Escape") dialog.remove();
+        });
+        dialog.addEventListener("mousedown", (e) => { if (e.target === dialog) dialog.remove(); });
+    }
+
+    moveNodeToCategory(nodeType, targetCatId) {
+        const node = this.favorites.nodes.find(n => n.type === nodeType);
+        if (!node) return;
+        if (node.categoryId === targetCatId) return;
+        node.categoryId = targetCatId;
+        this.saveFavorites();
+        this.renderFavorites();
+        this.renderCategories();
+    }
+
+    showRenameNodeDialog(nodeType) {
+        const node = this.favorites.nodes.find(n => n.type === nodeType);
+        if (!node) return;
+        const oldName = node.displayName || node.type;
+
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">重命名</div>
+                <div class="nf-dialog-body">
+                    <label>显示名称：</label>
+                    <input type="text" id="nf-node-rename-input" value="${oldName.replace(/"/g, '&quot;')}" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #555;border-radius:4px;color:#ddd;margin-bottom:10px;box-sizing:border-box;" />
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(dialog);
+
+        const input = dialog.querySelector("#nf-node-rename-input");
+        input.focus();
+        input.select();
+
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => dialog.remove());
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", () => {
+            const newName = input.value.trim();
+            if (!newName) { dialog.remove(); return; }
+            node.displayName = newName;
+            this.saveFavorites();
+            this.renderFavorites();
+            dialog.remove();
+        });
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") dialog.querySelector("#nf-dlg-ok").click();
+            if (e.key === "Escape") dialog.remove();
+        });
+        dialog.addEventListener("mousedown", (e) => { if (e.target === dialog) dialog.remove(); });
+    }
+
+    // ====== 拼音搜索支持 ======
+
+    /* ── 拼音首字母（如"补帧" → "bz"） ── */
+    toPinyinInitials(text) {
+        if (!text || typeof text !== 'string') return '';
+        try {
+            return window.pinyinPro.pinyin(text, { pattern: 'first', toneType: 'none', type: 'string' }).replace(/\s/g, '');
+        } catch(e) { return ''; }
+    }
+
+    /* ── 完整拼音（如"补帧" → "buzhen"） ── */
+    toPinyinFull(text) {
+        if (!text || typeof text !== 'string') return '';
+        try {
+            return window.pinyinPro.pinyin(text, { toneType: 'none', type: 'string' }).replace(/\s/g, '');
+        } catch(e) { return ''; }
+    }
+
+    fuzzyMatch(text, query) {
+        if (!query) return true;
+        text = text.toLowerCase();
+        query = query.toLowerCase();
+
+        if (text.includes(query)) return true;
+
+        let ti = 0;
+        let qi = 0;
+        while (ti < text.length && qi < query.length) {
+            if (text[ti] === query[qi]) {
+                qi++;
+            }
+            ti++;
+        }
+        return qi === query.length;
+    }
+
+    getFilteredFavorites() {
+        let nodes = this.favorites.nodes;
+
+        if (this.currentCategory !== "all") {
+            nodes = nodes.filter(n => n.categoryId === this.currentCategory);
+        }
+
+        if (this.currentSearch) {
+            nodes = nodes.filter(n =>
+                this.fuzzyMatch(n.displayName, this.currentSearch) ||
+                this.fuzzyMatch(n.type, this.currentSearch) ||
+                this.fuzzyMatch(n.category, this.currentSearch) ||
+                this.fuzzyMatch(this.toPinyinInitials(n.displayName), this.currentSearch) ||
+                this.fuzzyMatch(this.toPinyinFull(n.displayName), this.currentSearch)
+            );
+        }
+
+        const sortMode = this.favorites.sortMode || "default";
+        if (sortMode === "time") {
+            return nodes.sort((a, b) => {
+                return (b.lastUsed || 0) - (a.lastUsed || 0);
+            });
+        } else {
+            return nodes.sort((a, b) => {
+                if ((b.useCount || 0) !== (a.useCount || 0)) return (b.useCount || 0) - (a.useCount || 0);
+                return (b.lastUsed || 0) - (a.lastUsed || 0);
+            });
+        }
+    }
+
+    getFilteredWorkflows() {
+        let workflows = this.favorites.workflows || [];
+        if (this.currentCategory !== "all") {
+            workflows = workflows.filter(w => w.categoryId === this.currentCategory);
+        }
+        if (this.currentSearch) {
+            workflows = workflows.filter(w =>
+                this.fuzzyMatch(w.name, this.currentSearch) ||
+                this.fuzzyMatch(this.toPinyinInitials(w.name), this.currentSearch) ||
+                this.fuzzyMatch(this.toPinyinFull(w.name), this.currentSearch)
+            );
+        }
+        return workflows.sort((a, b) => {
+            if ((b.useCount || 0) !== (a.useCount || 0)) return (b.useCount || 0) - (a.useCount || 0);
+            return (b.lastUsed || 0) - (a.lastUsed || 0);
+        });
+    }
+
+    getCategoryById(id) {
+        return this.favorites.categories.find(c => c.id === id);
+    }
+
+    setSortMode(mode) {
+        this.favorites.sortMode = mode;
+        this.saveFavorites();
+        this.renderFavorites();
+        this.updateSortButtons();
+    }
+
+    updateSortButtons() {
+        const defaultBtn = this.panel?.querySelector("#nf-sort-default");
+        const timeBtn = this.panel?.querySelector("#nf-sort-time");
+        if (!defaultBtn || !timeBtn) return;
+
+        const mode = this.favorites.sortMode || "default";
+        defaultBtn.classList.toggle("active", mode === "default");
+        timeBtn.classList.toggle("active", mode === "time");
+    }
+
+    updateClearButtonVisibility() {
+        const clearBtn = this.panel?.querySelector("#nf-clear-btn");
+        if (clearBtn) {
+            clearBtn.style.display = this.searchInput && this.searchInput.value.length > 0 ? "flex" : "none";
+        }
+    }
+
+    renderCategories() {
+        if (!this.categoryList) return;
+
+        const cats = [...this.favorites.categories].sort((a, b) => (a.order || 0) - (b.order || 0));
+        const allInvalid = this.getInvalidFavorites().length;
+        let html = `
+            <div class="nf-category-item ${this.currentCategory === 'all' ? 'active' : ''}" data-cat="all">
+                <span class="nf-cat-name">全部</span>
+                ${allInvalid > 0 ? `<span class="nf-cat-invalid-count" title="${allInvalid}个失效节点">${allInvalid}</span>` : ''}
+            </div>
+        `;
+
+        for (const cat of cats) {
+            const catNodes = this.favorites.nodes.filter(n => n.categoryId === cat.id);
+            const invalidInCat = catNodes.filter(n => !this.isNodeTypeValid(n.type)).length;
+            html += `
+                <div class="nf-category-item ${this.currentCategory === cat.id ? 'active' : ''}" data-cat="${cat.id}">
+                    <span class="nf-cat-drag-handle" draggable="true" data-cat="${cat.id}" title="拖动调整顺序">⠿</span>
+                    <span class="nf-cat-name" title="${cat.name}">${cat.name}</span>
+                    ${invalidInCat > 0 ? `<span class="nf-cat-invalid-count" title="${invalidInCat}个失效节点">${invalidInCat}</span>` : ''}
+                </div>
+            `;
+        }
+
+        this.categoryList.innerHTML = html;
+
+        this.categoryList.querySelectorAll(".nf-category-item").forEach(item => {
+            item.addEventListener("click", (e) => {
+                this.currentCategory = item.dataset.cat;
+                this.renderCategories();
+                this.renderFavorites();
+            });
+            item.addEventListener("dragover", (e) => {
+                e.preventDefault();
+                const isCatDrag = e.dataTransfer && Array.from(e.dataTransfer.types).includes("text/rui-cat-id");
+                if (isCatDrag) {
+                    // 分类拖动：在两项之间的间隙高亮插入位置
+                    const catId = item.dataset.cat;
+                    if (catId === "all") { this._removeCatInsertIndicator(); return; }
+                    const rect = item.getBoundingClientRect();
+                    const before = (e.clientY - rect.top) < rect.height / 2;
+                    const cats = this.favorites.categories;
+                    const idx = cats.findIndex(c => c.id === catId);
+                    if (idx < 0) return;
+                    this._catInsertIndex = before ? idx : idx + 1;
+                    this._showCatInsertIndicator(this._catInsertIndex);
+                    return;
+                }
+                // 节点拖入：高亮目标分类项
+                item.style.background = "rgba(76,175,80,0.3)";
+                item.style.borderColor = "#4CAF50";
+            });
+            item.addEventListener("dragleave", () => {
+                item.style.background = "";
+                item.style.borderColor = "";
+            });
+            item.addEventListener("drop", (e) => {
+                e.preventDefault();
+                item.style.background = "";
+                item.style.borderColor = "";
+                // 拖动分类项重新排序（插入到间隙位置）
+                const dragCatId = e.dataTransfer.getData("text/rui-cat-id");
+                if (dragCatId) {
+                    const insertIndex = this._catInsertIndex;
+                    this._removeCatInsertIndicator();
+                    this._catInsertIndex = null;
+                    if (insertIndex !== null && insertIndex !== undefined) {
+                        this.reorderCategoryToIndex(dragCatId, insertIndex);
+                    }
+                    return;
+                }
+                // 原有：把节点拖入分类
+                const nodeType = e.dataTransfer.getData("text/rui-node-type");
+                if (!nodeType) return;
+                const targetCat = item.dataset.cat === "all" ? "default" : item.dataset.cat;
+                this.moveNodeToCategory(nodeType, targetCat);
+            });
+            item.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const catId = item.dataset.cat;
+                if (catId === "all") return;
+                this.showCategoryContextMenu(e.clientX, e.clientY, catId);
+            });
+
+            // 排序手柄：拖动分类项调整顺序
+            const handle = item.querySelector(".nf-cat-drag-handle");
+            if (handle) {
+                handle.addEventListener("dragstart", (e) => {
+                    e.stopPropagation();
+                    e.dataTransfer.effectAllowed = "move";
+                    e.dataTransfer.setData("text/rui-cat-id", handle.dataset.cat);
+                    item.classList.add("nf-cat-dragging");
+                });
+                handle.addEventListener("dragend", () => {
+                    item.classList.remove("nf-cat-dragging");
+                    this._removeCatInsertIndicator();
+                    this._catInsertIndex = null;
+                });
+                // 阻止点击手柄时触发分类选中
+                handle.addEventListener("click", (e) => e.stopPropagation());
+            }
+        });
+    }
+
+    showCategoryContextMenu(x, y, catId) {
+        // 移除已有菜单
+        document.querySelectorAll(".nf-cat-context-menu").forEach(el => el.remove());
+
+        const menu = document.createElement("div");
+        menu.className = "nf-cat-context-menu";
+        menu.style.cssText = `position:fixed;left:${x}px;top:${y}px;z-index:99999;background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:4px 0;min-width:120px;box-shadow:0 4px 12px rgba(0,0,0,0.5);`;
+        const cats = this.favorites.categories;
+        const catIdx = cats.findIndex(c => c.id === catId);
+        const canUp = catIdx > 0;
+        const canDown = catIdx >= 0 && catIdx < cats.length - 1;
+
+        menu.innerHTML = `
+            <div class="nf-cat-menu-item" data-action="up" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;${canUp ? '' : 'opacity:0.4;pointer-events:none;'}">
+                <span style="color:#2196F3;">▲</span> 上移
+            </div>
+            <div class="nf-cat-menu-item" data-action="down" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;${canDown ? '' : 'opacity:0.4;pointer-events:none;'}">
+                <span style="color:#2196F3;">▼</span> 下移
+            </div>
+            <div style="border-top:1px solid #444;margin:4px 0;"></div>
+            <div class="nf-cat-menu-item" data-action="edit" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#FF9800;">✎</span> 编辑分类
+            </div>
+            <div class="nf-cat-menu-item" data-action="delete" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#f44336;">×</span> 删除分类
+            </div>
+        `;
+
+        // 悬停效果
+        menu.querySelectorAll(".nf-cat-menu-item").forEach(el => {
+            el.addEventListener("mouseenter", () => el.style.background = "#3a3a3a");
+            el.addEventListener("mouseleave", () => el.style.background = "");
+            el.addEventListener("click", (e) => {
+                e.stopPropagation();
+                menu.remove();
+                if (el.dataset.action === "up") {
+                    this.moveCategory(catId, -1);
+                } else if (el.dataset.action === "down") {
+                    this.moveCategory(catId, 1);
+                } else if (el.dataset.action === "edit") {
+                    this.showEditCategoryDialog(catId);
+                } else if (el.dataset.action === "delete") {
+                    if (confirm(ruiT('确定删除该分类吗？','Sure to delete this category?'))){
+                        this.deleteCategory(catId);
+                    }
+                }
+            });
+        });
+
+        document.body.appendChild(menu);
+        this._adjustContextMenuPosition(menu);
+
+        // 点击菜单外关闭
+        const closeMenu = (e) => {
+            if (!menu.contains(e.target)) {
+                menu.remove();
+                document.removeEventListener("click", closeMenu);
+                document.removeEventListener("contextmenu", closeMenu);
+            }
+        };
+        requestAnimationFrame(() => {
+            document.addEventListener("click", closeMenu);
+            document.addEventListener("contextmenu", closeMenu);
+        });
+    }
+
+    showNodeContextMenu(x, y, nodeType, nodeName) {
+        document.querySelectorAll(".nf-cat-context-menu").forEach(el => el.remove());
+
+        const menu = document.createElement("div");
+        menu.className = "nf-cat-context-menu";
+        menu.style.cssText = `position:fixed;left:${x}px;top:${y}px;z-index:99999;background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:4px 0;min-width:130px;box-shadow:0 4px 12px rgba(0,0,0,0.5);`;
+        const nodeData = this.favorites.nodes.find(n => n.type === nodeType);
+        const useCount = nodeData?.useCount || 0;
+
+        menu.innerHTML = `
+            <div class="nf-cat-menu-item" data-action="move" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#FF9800;">📁</span> 修改分类
+            </div>
+            <div class="nf-cat-menu-item" data-action="rename" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#2196F3;">✏️</span> 重命名
+            </div>
+            <div class="nf-cat-menu-item" data-action="clear" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#FF5722;">🗑</span> 清空使用频率${useCount > 0 ? ` (${useCount}次)` : ''}
+            </div>
+            <div style="border-top:1px solid #444;margin:4px 0;"></div>
+            <div class="nf-cat-menu-item" data-action="delete" style="padding:8px 16px;cursor:pointer;color:#ddd;font-size:13px;display:flex;align-items:center;gap:8px;transition:background:0.15s;">
+                <span style="color:#f44336;">×</span> ${ruiT('取消收藏','Unfavorite')}
+            </div>
+        `;
+
+        menu.querySelectorAll(".nf-cat-menu-item").forEach(el => {
+            el.addEventListener("mouseenter", () => el.style.background = "#3a3a3a");
+            el.addEventListener("mouseleave", () => el.style.background = "");
+            el.addEventListener("click", (e) => {
+                e.stopPropagation();
+                menu.remove();
+                if (el.dataset.action === "rename") {
+                    this.showRenameNodeDialog(nodeType);
+                } else if (el.dataset.action === "move") {
+                    this.showMoveNodeCategoryDialog(nodeType);
+                } else if (el.dataset.action === "refresh-preview") {
+                    this.refreshFavoritePreview(nodeType, nodeName);
+                } else if (el.dataset.action === "clear") {
+                    if (useCount > 0 && confirm(ruiT('确定清空','Clear ') + `"${nodeName}"` + ruiT('的使用频率记录吗？',' usage frequency records?'))){
+                        const n = this.favorites.nodes.find(x => x.type === nodeType);
+                        if (n) {
+                            n.useCount = 0;
+                            this.saveFavorites();
+                            this.renderFavorites();
+                        }
+                    }
+                } else if (el.dataset.action === "delete") {
+                    if (confirm(ruiT('确定要取消收藏','Sure to unfavorite ') + `"${nodeName}"` + ruiT('吗？','?'))){
+                        this.removeFavorite(nodeType);
+                    }
+                }
+            });
+        });
+
+        document.body.appendChild(menu);
+        this._adjustContextMenuPosition(menu);
+
+        const closeMenu = (e) => {
+            if (!menu.contains(e.target)) {
+                menu.remove();
+                document.removeEventListener("click", closeMenu);
+                document.removeEventListener("contextmenu", closeMenu);
+            }
+        };
+        requestAnimationFrame(() => {
+            document.addEventListener("click", closeMenu);
+            document.addEventListener("contextmenu", closeMenu);
+        });
+    }
+
+    // 语言切换时刷新面板内一次性构建的静态文案
+    refreshStaticLabels() {
+        const c = this.panel;
+        if (!c) return;
+        const title = c.querySelector(".nf-title");
+        if (title) title.textContent = "⭐ " + ruiT('Rui收藏','Rui Favorites');
+        const tabFav = c.querySelector('.nf-tab-btn[data-tab="favorites"]');
+        if (tabFav) tabFav.textContent = "⭐ " + ruiT('收藏','Favorites');
+        const tabNotes = c.querySelector('.nf-tab-btn[data-tab="notes"]');
+        if (tabNotes) tabNotes.textContent = "📝 " + ruiT('备注','Notes');
+        const search = c.querySelector("#nf-search-input");
+        if (search) search.placeholder = "🔍 " + ruiT('搜索收藏的节点...','Search favorited nodes...');
+        const catHeader = c.querySelector(".nf-categories-header span");
+        if (catHeader) catHeader.textContent = ruiT('分类','Categories');
+        const favHeader = c.querySelector(".nf-fav-header-left span");
+        if (favHeader) favHeader.textContent = ruiT('收藏节点','Favorite Nodes');
+        const notesHeader = c.querySelector(".nf-notes-header span");
+        if (notesHeader) notesHeader.textContent = "📝 " + ruiT('记事本','Notepad');
+    }
+
+    renderFavorites() {
+        if (!this.favoritesList) return;
+
+        const nodes = this.getFilteredFavorites();
+        const countEl = this.panel?.querySelector("#nf-count");
+        if (countEl) {
+            countEl.textContent = nodes.length;
+        }
+
+        // 失效节点清理按钮
+        const invalidCount = this.getInvalidFavorites().length;
+        const clearInvalidBtn = this.panel?.querySelector("#nf-clear-invalid-btn");
+        if (clearInvalidBtn) {
+            if (invalidCount > 0) {
+                clearInvalidBtn.style.display = "inline-flex";
+                clearInvalidBtn.textContent = `🧹 清理失效(${invalidCount})`;
+            } else {
+                clearInvalidBtn.style.display = "none";
+            }
+        }
+
+        // 过滤工作流
+        const workflows = this.getFilteredWorkflows();
+        const totalCount = nodes.length + workflows.length;
+
+        if (totalCount === 0) {
+            this.favoritesList.innerHTML = `<div class="nf-empty-tip">暂无匹配的收藏节点</div>`;
+            return;
+        }
+
+        let html = "";
+        let listInvalidCount = 0;
+        // 渲染普通收藏节点
+        for (const node of nodes) {
+            const cat = this.getCategoryById(node.categoryId);
+            const catName = cat ? cat.name : "未知";
+            const isValid = this.isNodeTypeValid(node.type);
+            if (!isValid) listInvalidCount++;
+
+            const useCount = node.useCount || 0;
+            const useInfo = this.getUseLevel(useCount);
+            const itemClass = `nf-fav-item${isValid ? '' : ' nf-invalid'}${this.favorites.useColorsEnabled !== false && useInfo.level > 0 ? ' nf-fav-use-l' + useInfo.level : ''}`;
+            const titleText = isValid
+                ? ""
+                : "节点已失效（插件可能已卸载）· 右键可删除";
+            const nameText = isValid
+                ? node.displayName
+                : `${node.displayName} <span style="color:#ff6b6b;font-size:11px;">[已失效]</span>`;
+            const typeText = isValid
+                ? `${useCount > 0 ? `使用${useCount}次` : ''}`
+                : `${node.type}`;
+            const dragAttr = isValid ? 'draggable="true"' : 'draggable="false"';
+
+            // 预览仅使用截图，不再生成 HTML 回退
+
+            html += `
+                <div class="${itemClass}"${this.favorites.useColorsEnabled !== false && useInfo.level > 0 ? ` style="--nf-use-color:${useInfo.color};"` : ''} data-type="${node.type}" data-order="${node.order || 0}" data-kind="node" ${dragAttr} title="${titleText}">
+                    <div class="nf-fav-info">
+                        <div class="nf-fav-name">${nameText}</div>
+                        <div class="nf-fav-type">${typeText}</div>
+                    </div>
+                    ${isValid ? '' : `<button class="nf-del-invalid-btn" data-type="${node.type}" title="移除此失效收藏">✕</button>`}
+                </div>
+            `;
+        }
+
+        // 渲染多节点收藏
+        if (workflows.length > 0) {
+            html += `<div style="font-size:11px;color:#aaa;padding:8px 4px 4px;border-top:1px solid #3a3a3a;margin-top:4px;">🔗 多节点收藏</div>`;
+            for (const wf of workflows) {
+                const cat = this.getCategoryById(wf.categoryId);
+                const useCount = wf.useCount || 0;
+                const useInfo = this.getUseLevel(useCount);
+                const useClass = this.favorites.useColorsEnabled !== false && useInfo.level > 0 ? ` nf-fav-use-l${useInfo.level}` : '';
+                const useStyle = this.favorites.useColorsEnabled !== false && useInfo.level > 0 ? ` style="--nf-use-color:${useInfo.color};"` : '';
+                html += `
+                    <div class="nf-fav-item nf-wf-item${useClass}"${useStyle} data-wf-id="${wf.id}" data-kind="workflow" draggable="true">
+                    <div class="nf-fav-info">
+                        <div class="nf-fav-name">🔗 ${wf.name}</div>
+                            <div class="nf-fav-type">${wf.nodesData ? wf.nodesData.length + '个节点' : ''}${useCount > 0 ? ` · 使用${useCount}次` : ''}</div>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        this.favoritesList.innerHTML = html;
+
+        const self = this;
+        this.favoritesList.querySelectorAll(".nf-fav-item").forEach(item => {
+            item.addEventListener("dragstart", (e) => {
+                if (item.dataset.kind === "workflow") {
+                    e.dataTransfer.setData("text/rui-workflow-id", item.dataset.wfId);
+                } else {
+                    e.dataTransfer.setData("text/rui-node-type", item.dataset.type);
+                }
+                e.dataTransfer.effectAllowed = "move";
+                item.style.opacity = "0.5";
+                if (self.searchInput && self.searchInput === document.activeElement) {
+                    self.searchInput.blur();
+                }
+            });
+            item.addEventListener("dragend", () => {
+                item.style.opacity = "";
+            });
+
+            let startX, startY;
+            let isDrag = false;
+            let dragInfo = null;
+            let isReorderDrag = false;
+            let isWorkflowDrag = false;
+
+            const onMouseMove = (e) => {
+                if (e.buttons !== 1 || !dragInfo || isDrag) return;
+                const dx = Math.abs(e.clientX - startX);
+                const dy = Math.abs(e.clientY - startY);
+                if (dx > 3 || dy > 3) {
+                    isDrag = true;
+                    if (self.searchInput && self.searchInput === document.activeElement) {
+                        self.searchInput.blur();
+                    }
+                    if (isReorderDrag) {
+                        self.startReorderDrag(item, e.clientY);
+                    } else if (isWorkflowDrag) {
+                        self.draggingWorkflowId = dragInfo.id;
+                        self.updateDragPreview(e.clientX, e.clientY, "🔗 " + dragInfo.name);
+                    } else {
+                        self.draggingNodeType = dragInfo.type;
+                        self.updateDragPreview(e.clientX, e.clientY, dragInfo.name);
+                    }
+                }
+            };
+
+            const onMouseUp = (e) => {
+                if (isReorderDrag) {
+                    self.endReorderDrag();
+                } else if (self.draggingNodeType) {
+                    self.draggingNodeType = null;
+                    self.removeDragPreview();
+                } else if (self.draggingWorkflowId) {
+                    self.draggingWorkflowId = null;
+                    self.removeDragPreview();
+                } else if (!isDrag && dragInfo) {
+                    if (self.searchInput && self.searchInput === document.activeElement) {
+                        self.searchInput.blur();
+                    }
+                    if (isWorkflowDrag) {
+                        self.addWorkflowToCanvasById(dragInfo.id);
+                    } else {
+                        self.addNodeToCanvas(dragInfo.type);
+                    }
+                    self.collapsePanel();
+                }
+
+                dragInfo = null;
+                isDrag = false;
+                isReorderDrag = false;
+                isWorkflowDrag = false;
+                document.removeEventListener("mousemove", onMouseMove);
+                document.removeEventListener("mouseup", onMouseUp);
+            };
+
+            item.addEventListener("mousedown", (e) => {
+                if (e.button !== 0) return;
+
+                const kind = item.dataset.kind;
+                startX = e.clientX;
+                startY = e.clientY;
+                isDrag = false;
+                isWorkflowDrag = kind === "workflow";
+                isReorderDrag = false;
+
+                if (kind === "workflow") {
+                    const wfId = item.dataset.wfId;
+                    const wf = self.favorites.workflows.find(w => w.id === wfId);
+                    dragInfo = {
+                        id: wfId,
+                        name: wf ? wf.name : "工作流",
+                        color: "#2196F3"
+                    };
+                } else {
+                    dragInfo = {
+                        type: item.dataset.type,
+                        name: item.querySelector(".nf-fav-name")?.textContent || item.dataset.type,
+                        color: "#f44336"
+                    };
+                }
+                e.preventDefault();
+                document.addEventListener("mousemove", onMouseMove);
+                document.addEventListener("mouseup", onMouseUp);
+            });
+        });
+
+        this.favoritesList.querySelectorAll(".nf-fav-item").forEach(item => {
+            item.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (item.dataset.kind === "workflow") {
+                    const wfId = item.dataset.wfId;
+                    const wfName = item.querySelector(".nf-fav-name")?.textContent || "工作流";
+                    this.showWorkflowContextMenu(e.clientX, e.clientY, wfId, wfName);
+                } else {
+                    const nodeType = item.dataset.type;
+                    const nodeName = item.querySelector(".nf-fav-name")?.textContent || nodeType;
+                    this.showNodeContextMenu(e.clientX, e.clientY, nodeType, nodeName);
+                }
+            });
+
+        });
+
+        // 预览容器（body 下，跳过面板裁剪）
+        if (!this._previewEl) {
+            this._previewEl = document.createElement("div");
+            this._previewEl.id = "nf-hover-preview";
+            this._previewEl.style.cssText = "display:none;position:fixed;z-index:99999;background:transparent;border:none;border-radius:0;overflow:visible;pointer-events:auto;";
+            document.body.appendChild(this._previewEl);
+        }
+        // 预览容器自身鼠标事件
+        this._previewEl.onmouseenter = () => {
+            if (this._previewHideTimer) { clearTimeout(this._previewHideTimer); this._previewHideTimer = null; }
+        };
+        this._previewEl.onmouseleave = () => {
+            this._hidePreview(300);
+        };
+
+        // 使用 mouseover/mouseout 事件委托，避免子元素边界导致闪烁
+        this.favoritesList.onmouseover = (e) => {
+            const item = e.target.closest(".nf-fav-item");
+            if (!item) return;
+            if (!item.dataset.kind || (item.dataset.kind !== "node" && item.dataset.kind !== "workflow")) return;
+            this._showPreview(item);
+        };
+        this.favoritesList.onmouseout = (e) => {
+            const item = e.target.closest(".nf-fav-item");
+            if (!item) return;
+            if (!item.dataset.kind || (item.dataset.kind !== "node" && item.dataset.kind !== "workflow")) return;
+            if (item.contains(e.relatedTarget)) return;
+            this._hidePreview(250);
+        };
+
+        // 失效节点删除按钮
+        this.favoritesList.querySelectorAll(".nf-del-invalid-btn").forEach(btn => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const nodeType = btn.dataset.type;
+                if (confirm(ruiT('确定要移除这个失效的收藏节点吗？','Sure to remove this invalid favorite node?'))){
+                    self.removeFavorite(nodeType);
+                }
+            });
+            btn.addEventListener("mousedown", (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+            });
+        });
+    }
+
+    // ===== IndexedDB 节点预览截图存储 =====
+    _openPreviewDB() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open("RuiFavorites", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains("nodePreviews")) {
+                    db.createObjectStore("nodePreviews", { keyPath: "type" });
+                }
+            };
+        });
+    }
+
+    async _savePreviewImage(nodeType, dataUrl) {
+        try {
+            const db = await this._openPreviewDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction("nodePreviews", "readwrite");
+                const store = tx.objectStore("nodePreviews");
+                const req = store.put({ type: nodeType, dataUrl, updatedAt: Date.now() });
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            console.warn("[Rui] 保存预览截图失败:", e);
+        }
+    }
+
+    async _getPreviewImage(nodeType) {
+        try {
+            const db = await this._openPreviewDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction("nodePreviews", "readonly");
+                const store = tx.objectStore("nodePreviews");
+                const req = store.get(nodeType);
+                req.onsuccess = () => resolve(req.result?.dataUrl || null);
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            console.warn("[Rui] 读取预览截图失败:", e);
+            return null;
+        }
+    }
+
+    async _deletePreviewImage(nodeType) {
+        try {
+            const db = await this._openPreviewDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction("nodePreviews", "readwrite");
+                const store = tx.objectStore("nodePreviews");
+                const req = store.delete(nodeType);
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            console.warn("[Rui] 删除预览截图失败:", e);
+        }
+    }
+
+    async _getAllPreviewImages() {
+        try {
+            const db = await this._openPreviewDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction("nodePreviews", "readonly");
+                const store = tx.objectStore("nodePreviews");
+                const req = store.getAll();
+                req.onsuccess = () => {
+                    const map = {};
+                    for (const item of req.result || []) {
+                        if (item.type && item.dataUrl) map[item.type] = item.dataUrl;
+                    }
+                    resolve(map);
+                };
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            console.warn("[Rui] 读取所有预览截图失败:", e);
+            return {};
+        }
+    }
+
+    async _saveAllPreviewImages(previews, { replace = false } = {}) {
+        try {
+            const db = await this._openPreviewDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction("nodePreviews", "readwrite");
+                const store = tx.objectStore("nodePreviews");
+                const now = Date.now();
+                if (replace) store.clear();
+                for (const [type, dataUrl] of Object.entries(previews)) {
+                    if (type && dataUrl) store.put({ type, dataUrl, updatedAt: now });
+                }
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        } catch (e) {
+            console.warn("[Rui] 批量保存预览截图失败:", e);
+        }
+    }
+
+    _createPreviewPlaceholder(label) {
+        const canvas = document.createElement("canvas");
+        canvas.width = 420;
+        canvas.height = 180;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#252525";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = "#555";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(8, 8, canvas.width - 16, canvas.height - 16);
+        ctx.fillStyle = "#ddd";
+        ctx.font = '600 22px "Microsoft YaHei", sans-serif';
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(label || "Rui"), canvas.width / 2, canvas.height / 2, canvas.width - 40);
+        return canvas.toDataURL("image/png");
+    }
+
+    async refreshFavoritePreview(nodeType, nodeName) {
+        const node = app.graph?._nodes?.find(item => item.type === nodeType);
+        if (!node) {
+            alert(ruiT('请先把该节点放在当前画布中，再刷新缩略图。', 'Place this node on the current canvas before refreshing its thumbnail.'));
+            return;
+        }
+        const dataUrl = await this._captureNodeImage(node) || this._createPreviewPlaceholder(nodeName || node.title || nodeType);
+        await this._savePreviewImage(nodeType, dataUrl);
+        this._previewCanvasCache.delete(nodeType);
+        this._previewEl?.removeAttribute("data-current-type");
+    }
+
+    async _captureNodeImage(node) {
+        try {
+            const gc = (typeof app !== "undefined" && app?.canvas) ? app.canvas : null;
+            if (!gc || !gc.canvas || !node || !node.pos) return null;
+            gc.setDirtyCanvas?.(true, true);
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const scale = gc.ds?.scale || 1;
+            const offset = gc.ds?.offset || [0, 0];
+            const size = node.size || (typeof node.computeSize === "function" ? node.computeSize() : [200, 80]);
+            // 判断节点是否有标题栏：
+            // 1. title_height 显式设置为 0 或负数 → 无标题栏
+            // 2. 节点类型为Rui标题（RuiTitle）→ 无标题栏（自定义绘制）
+            // 3. bgcolor 为 transparent 且 color 为透明色 → 可能是无标题栏的自定义节点
+            // 4. 节点已折叠 → 只截取标题栏
+            // 5. 其他情况 → 有标题栏（使用默认值）
+            const isCollapsed = node.flags?.collapsed || node.collapsed;
+            const rawTitleHeight = node.title_height;
+            const defaultTitleHeight = LiteGraph.NODE_TITLE_HEIGHT || 30;
+            const hasExplicitNoTitle = rawTitleHeight != null && rawTitleHeight <= 0;
+
+            // 判断是否为无标题栏的自定义节点（如Rui标题）
+            const isNoTitleCustomNode =
+                node.type === "RuiTitle" ||
+                (node.bgcolor === "transparent" && (node.color === "#fff0" || node.color === "transparent"));
+
+            let titleHeight;
+            let captureHeight;
+            let captureTop; // 相对于 node.pos[1] 的偏移（像素，未缩放）
+
+            if (isCollapsed) {
+                // 折叠状态：只截取标题栏
+                titleHeight = (rawTitleHeight != null && rawTitleHeight > 0) ? rawTitleHeight : defaultTitleHeight;
+                captureHeight = titleHeight;
+                captureTop = -titleHeight;
+            } else if (hasExplicitNoTitle || isNoTitleCustomNode) {
+                // 无标题栏：从 body 顶部开始，高度就是 size[1]
+                titleHeight = 0;
+                captureHeight = size[1];
+                captureTop = 0;
+            } else {
+                // 正常节点：标题栏 + body
+                titleHeight = (rawTitleHeight != null && rawTitleHeight > 0) ? rawTitleHeight : defaultTitleHeight;
+                captureHeight = titleHeight + size[1];
+                captureTop = -titleHeight;
+            }
+
+            const sourceCanvas = gc.canvas;
+            const canvasRect = sourceCanvas.getBoundingClientRect();
+            if (canvasRect.width <= 0 || canvasRect.height <= 0) return null;
+            const cssToPxX = sourceCanvas.width / canvasRect.width;
+            const cssToPxY = sourceCanvas.height / canvasRect.height;
+            const canvasPoint = gc.ds?.convertOffsetToCanvas
+                ? gc.ds.convertOffsetToCanvas([node.pos[0], node.pos[1] + captureTop])
+                : [(node.pos[0] + offset[0]) * scale, (node.pos[1] + captureTop + offset[1]) * scale];
+            const srcX = Math.floor(canvasPoint[0] * cssToPxX);
+            const srcY = Math.floor(canvasPoint[1] * cssToPxY);
+            const srcW = Math.ceil(size[0] * scale * cssToPxX);
+            const srcH = Math.ceil(captureHeight * scale * cssToPxY);
+            if (srcX < 0 || srcY < 0 || srcW <= 0 || srcH <= 0 || srcX + srcW > sourceCanvas.width || srcY + srcH > sourceCanvas.height) return null;
+
+            const canvas = document.createElement("canvas");
+            canvas.width = srcW;
+            canvas.height = srcH;
+            const ctx = canvas.getContext("2d");
+
+            // 步骤1：绘制主 canvas 区域（包含所有 LiteGraph 渲染的内容）
+            ctx.drawImage(sourceCanvas, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+
+            // 步骤2：绘制该节点的 DOM widget 内容（背景色 + 内部 img/canvas/video）
+            const pxToCssX = canvasRect.width / sourceCanvas.width;
+            const pxToCssY = canvasRect.height / sourceCanvas.height;
+
+            const nodeScreenLeft = canvasRect.left + srcX * pxToCssX;
+            const nodeScreenTop = canvasRect.top + srcY * pxToCssY;
+            const nodeScreenW = srcW * pxToCssX;
+            const nodeScreenH = srcH * pxToCssY;
+            const nodeScreenRight = nodeScreenLeft + nodeScreenW;
+            const nodeScreenBottom = nodeScreenTop + nodeScreenH;
+
+            // 从 node.widgets 中收集所有 DOM widget 的 element（最准确的方式）
+            const domWidgetEls = [];
+            if (node.widgets && node.widgets.length) {
+                for (const w of node.widgets) {
+                    if (w && w.element && w.element instanceof HTMLElement) {
+                        const r = w.element.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            domWidgetEls.push(w.element);
+                        }
+                    }
+                }
+            }
+
+            // 辅助：将屏幕矩形转换为截图像素坐标
+            const toScreenshotRect = (rect) => ({
+                x: (rect.left - nodeScreenLeft) * cssToPxX,
+                y: (rect.top - nodeScreenTop) * cssToPxY,
+                w: rect.width * cssToPxX,
+                h: rect.height * cssToPxY
+            });
+
+            // 辅助：递归收集元素及其后代的背景绘制信息（按 DOM 顺序，先父后子）
+            const collectBgDraws = (el, draws) => {
+                if (!el || !(el instanceof HTMLElement)) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return;
+                if (rect.right <= nodeScreenLeft || rect.left >= nodeScreenRight) return;
+                if (rect.bottom <= nodeScreenTop || rect.top >= nodeScreenBottom) return;
+
+                // 获取背景色
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                const hasBg = bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)';
+
+                // 获取背景图（如 background-image: url(...)）
+                const bgImage = style.backgroundImage;
+                const hasBgImage = bgImage && bgImage !== 'none';
+
+                if (hasBg || hasBgImage) {
+                    const sr = toScreenshotRect(rect);
+                    draws.push({
+                        type: 'bg',
+                        x: sr.x,
+                        y: sr.y,
+                        w: sr.w,
+                        h: sr.h,
+                        color: hasBg ? bg : null,
+                        bgImage: hasBgImage ? bgImage : null,
+                        borderRadius: style.borderRadius || '0'
+                    });
+                }
+
+                // 递归子元素
+                for (let i = 0; i < el.children.length; i++) {
+                    collectBgDraws(el.children[i], draws);
+                }
+            };
+
+            // 辅助：收集所有 img/canvas/video/svg 元素（按 DOM 顺序）
+            const collectImageDraws = (el, draws) => {
+                if (!el) return;
+                const innerEls = el.querySelectorAll('img, canvas, video, svg');
+                innerEls.forEach(el => {
+                    try {
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) return;
+                        if (r.right <= nodeScreenLeft || r.left >= nodeScreenRight) return;
+                        if (r.bottom <= nodeScreenTop || r.top >= nodeScreenBottom) return;
+                        const sr = toScreenshotRect(r);
+                        const isSvg = el.tagName?.toLowerCase() === 'svg';
+                        draws.push({
+                            type: isSvg ? 'svg' : 'image',
+                            el: el,
+                            x: sr.x,
+                            y: sr.y,
+                            w: sr.w,
+                            h: sr.h
+                        });
+                    } catch (_) {}
+                });
+            };
+
+            const collectTextDraws = (el, draws) => {
+                if (!el || !(el instanceof HTMLElement)) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return;
+                if (rect.right <= nodeScreenLeft || rect.left >= nodeScreenRight) return;
+                if (rect.bottom <= nodeScreenTop || rect.top >= nodeScreenBottom) return;
+                const style = window.getComputedStyle(el);
+                let value = "";
+                if (el instanceof HTMLInputElement) {
+                    if (!['checkbox', 'radio', 'color', 'range'].includes(el.type)) value = el.value;
+                } else if (el instanceof HTMLTextAreaElement) {
+                    value = el.value;
+                } else if (el instanceof HTMLSelectElement) {
+                    value = el.selectedOptions?.[0]?.textContent || "";
+                } else if (el.children.length === 0) {
+                    value = el.textContent || "";
+                }
+                value = value.replace(/\s+/g, " ").trim();
+                if (value && style.visibility !== 'hidden' && style.display !== 'none') {
+                    const sr = toScreenshotRect(rect);
+                    draws.push({
+                        ...sr,
+                        value,
+                        color: style.color || '#ddd',
+                        fontSize: (parseFloat(style.fontSize) || 12) * cssToPxY,
+                        fontFamily: style.fontFamily || 'sans-serif',
+                        fontWeight: style.fontWeight || '400',
+                        align: style.textAlign || 'left',
+                        paddingLeft: (parseFloat(style.paddingLeft) || 0) * cssToPxX,
+                        paddingRight: (parseFloat(style.paddingRight) || 0) * cssToPxX
+                    });
+                }
+                for (const child of el.children) collectTextDraws(child, draws);
+            };
+
+            // 收集所有绘制任务
+            const bgDraws = [];
+            const imageDraws = [];
+            const textDraws = [];
+
+            for (const widgetEl of domWidgetEls) {
+                collectBgDraws(widgetEl, bgDraws);
+                collectImageDraws(widgetEl, imageDraws);
+                collectTextDraws(widgetEl, textDraws);
+            }
+
+            // 先绘制所有背景（按 DOM 顺序，从外到内）
+            for (const d of bgDraws) {
+                try {
+                    ctx.fillStyle = d.color;
+                    if (d.borderRadius && d.borderRadius !== '0px' && d.borderRadius !== '0') {
+                        // 简单处理圆角：用矩形近似（不做复杂圆角裁剪）
+                        ctx.fillRect(d.x, d.y, d.w, d.h);
+                    } else {
+                        ctx.fillRect(d.x, d.y, d.w, d.h);
+                    }
+                } catch (_) {}
+            }
+
+            // 辅助：将 SVG 元素转换为可绘制的 Image 对象（同步方式，使用 data URL）
+            const svgToImage = (svgEl) => {
+                try {
+                    const clone = svgEl.cloneNode(true);
+                    // 确保 SVG 有明确的尺寸
+                    const rect = svgEl.getBoundingClientRect();
+                    if (!clone.getAttribute('width')) clone.setAttribute('width', rect.width);
+                    if (!clone.getAttribute('height')) clone.setAttribute('height', rect.height);
+                    if (!clone.getAttribute('viewBox') && rect.width && rect.height) {
+                        clone.setAttribute('viewBox', `0 0 ${rect.width} ${rect.height}`);
+                    }
+                    // 内联计算样式（简单处理：复制 fill 和 stroke）
+                    const style = window.getComputedStyle(svgEl);
+                    if (style.color && !clone.getAttribute('fill')) {
+                        // SVG 图标通常用 currentColor，需要替换为实际颜色
+                        const svgStr = new XMLSerializer().serializeToString(clone);
+                        const coloredSvg = svgStr.replace(/currentColor/g, style.color);
+                        const dataUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(coloredSvg);
+                        return dataUrl;
+                    }
+                    const svgStr = new XMLSerializer().serializeToString(clone);
+                    const dataUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgStr);
+                    return dataUrl;
+                } catch (e) {
+                    return null;
+                }
+            };
+
+            // 再绘制所有图片/画布/视频/SVG
+            const drawSvg = async (d) => {
+                const dataUrl = svgToImage(d.el);
+                if (!dataUrl) return;
+                const img = new Image();
+                const loaded = await new Promise(resolve => {
+                    img.onload = () => resolve(true);
+                    img.onerror = () => resolve(false);
+                    img.src = dataUrl;
+                });
+                if (loaded) ctx.drawImage(img, d.x, d.y, d.w, d.h);
+            };
+
+            for (const d of imageDraws) {
+                if (d.type === 'svg') {
+                    await drawSvg(d);
+                } else {
+                    try {
+                        ctx.drawImage(d.el, d.x, d.y, d.w, d.h);
+                    } catch (_) {}
+                }
+            }
+
+            // 补充：全局查找预览图片（如 Save Image 默认预览，可能不在 widgets 中）
+            // 注意：这些元素可能来自 ComfyUI 核心的预览系统，不通过 widget 管理
+            const globalImgs = document.querySelectorAll('img, canvas, svg');
+            for (const el of globalImgs) {
+                if (el === sourceCanvas || el.id === 'graph-canvas') continue;
+                // 跳过已经通过 widget 方式处理过的元素（避免重复绘制）
+                let alreadyHandled = false;
+                for (const widgetEl of domWidgetEls) {
+                    if (widgetEl.contains(el)) { alreadyHandled = true; break; }
+                }
+                if (alreadyHandled) continue;
+                try {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    if (rect.right <= nodeScreenLeft || rect.left >= nodeScreenRight) continue;
+                    if (rect.bottom <= nodeScreenTop || rect.top >= nodeScreenBottom) continue;
+                    const sr = toScreenshotRect(rect);
+                    const isSvg = el.tagName?.toLowerCase() === 'svg';
+                    if (isSvg) {
+                        const dataUrl = svgToImage(el);
+                        if (dataUrl) {
+                            const img = new Image();
+                            const loaded = await new Promise(resolve => {
+                                img.onload = () => resolve(true);
+                                img.onerror = () => resolve(false);
+                                img.src = dataUrl;
+                            });
+                            if (loaded) ctx.drawImage(img, sr.x, sr.y, sr.w, sr.h);
+                        }
+                    } else {
+                        ctx.drawImage(el, sr.x, sr.y, sr.w, sr.h);
+                    }
+                } catch (_) {}
+            }
+
+            for (const d of textDraws) {
+                ctx.fillStyle = d.color;
+                ctx.font = `${d.fontWeight} ${d.fontSize}px ${d.fontFamily}`;
+                ctx.textBaseline = 'middle';
+                let x = d.x + d.paddingLeft;
+                if (d.align === 'center') {
+                    ctx.textAlign = 'center';
+                    x = d.x + d.w / 2;
+                } else if (d.align === 'right' || d.align === 'end') {
+                    ctx.textAlign = 'right';
+                    x = d.x + d.w - d.paddingRight;
+                } else {
+                    ctx.textAlign = 'left';
+                }
+                ctx.fillText(d.value, x, d.y + d.h / 2, Math.max(1, d.w - d.paddingLeft - d.paddingRight));
+            }
+
+            return canvas.toDataURL("image/png");
+        } catch (e) {
+            console.warn("[Rui] 截图节点失败:", e);
+            return null;
+        }
+    }
+
+    async _captureWorkflowImage(selectedNodes) {
+        try {
+            const gc = (typeof app !== "undefined" && app?.canvas) ? app.canvas : null;
+            if (!gc || !gc.canvas || !selectedNodes || selectedNodes.length < 1) return null;
+            gc.setDirtyCanvas?.(true, true);
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const scale = gc.ds?.scale || 1;
+            const offset = gc.ds?.offset || [0, 0];
+
+            // 计算所有节点的包围盒
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const node of selectedNodes) {
+                const pos = node.pos || [0, 0];
+                const size = node.size || (typeof node.computeSize === "function" ? node.computeSize() : [200, 80]);
+                const titleH = (node.title_height != null && node.title_height > 0)
+                    ? node.title_height
+                    : (LiteGraph.NODE_TITLE_HEIGHT || 30);
+                const hasTitle = !(
+                    (node.title_height != null && node.title_height <= 0) ||
+                    node.type === "RuiTitle" ||
+                    (node.bgcolor === "transparent" && (node.color === "#fff0" || node.color === "transparent"))
+                );
+                const nodeTop = hasTitle ? (pos[1] - titleH) : pos[1];
+                const nodeBottom = pos[1] + size[1];
+                const nodeLeft = pos[0];
+                const nodeRight = pos[0] + size[0];
+                if (nodeLeft < minX) minX = nodeLeft;
+                if (nodeTop < minY) minY = nodeTop;
+                if (nodeRight > maxX) maxX = nodeRight;
+                if (nodeBottom > maxY) maxY = nodeBottom;
+            }
+
+            // 加一点边距，让连线也能截到
+            const padding = 40;
+            minX -= padding;
+            minY -= padding;
+            maxX += padding;
+            maxY += padding;
+
+            const sourceCanvas = gc.canvas;
+            const canvasRect = sourceCanvas.getBoundingClientRect();
+            if (canvasRect.width <= 0 || canvasRect.height <= 0) return null;
+            const cssToPxX = sourceCanvas.width / canvasRect.width;
+            const cssToPxY = sourceCanvas.height / canvasRect.height;
+            const canvasPoint = gc.ds?.convertOffsetToCanvas
+                ? gc.ds.convertOffsetToCanvas([minX, minY])
+                : [(minX + offset[0]) * scale, (minY + offset[1]) * scale];
+            const srcX = Math.floor(canvasPoint[0] * cssToPxX);
+            const srcY = Math.floor(canvasPoint[1] * cssToPxY);
+            const srcW = Math.ceil((maxX - minX) * scale * cssToPxX);
+            const srcH = Math.ceil((maxY - minY) * scale * cssToPxY);
+
+            if (srcX < 0 || srcY < 0 || srcW <= 0 || srcH <= 0 || srcX + srcW > sourceCanvas.width || srcY + srcH > sourceCanvas.height) return null;
+
+            const canvas = document.createElement("canvas");
+            canvas.width = srcW;
+            canvas.height = srcH;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(sourceCanvas, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+
+            // 绘制 DOM widget 内容（所有选中节点的）
+            const pxToCssX = canvasRect.width / sourceCanvas.width;
+            const pxToCssY = canvasRect.height / sourceCanvas.height;
+
+            const nodeScreenLeft = canvasRect.left + srcX * pxToCssX;
+            const nodeScreenTop = canvasRect.top + srcY * pxToCssY;
+            const nodeScreenW = srcW * pxToCssX;
+            const nodeScreenH = srcH * pxToCssY;
+            const nodeScreenRight = nodeScreenLeft + nodeScreenW;
+            const nodeScreenBottom = nodeScreenTop + nodeScreenH;
+
+            const toScreenshotRect = (rect) => ({
+                x: (rect.left - nodeScreenLeft) * cssToPxX,
+                y: (rect.top - nodeScreenTop) * cssToPxY,
+                w: rect.width * cssToPxX,
+                h: rect.height * cssToPxY
+            });
+
+            const collectBgDraws = (el, draws) => {
+                if (!el || !(el instanceof HTMLElement)) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return;
+                if (rect.right <= nodeScreenLeft || rect.left >= nodeScreenRight) return;
+                if (rect.bottom <= nodeScreenTop || rect.top >= nodeScreenBottom) return;
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                const hasBg = bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)';
+                if (hasBg) {
+                    const sr = toScreenshotRect(rect);
+                    draws.push({ type: 'bg', x: sr.x, y: sr.y, w: sr.w, h: sr.h, color: bg });
+                }
+                for (let i = 0; i < el.children.length; i++) {
+                    collectBgDraws(el.children[i], draws);
+                }
+            };
+
+            const collectImageDraws = (el, draws) => {
+                if (!el) return;
+                const innerEls = el.querySelectorAll('img, canvas, video, svg');
+                innerEls.forEach(el => {
+                    try {
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) return;
+                        if (r.right <= nodeScreenLeft || r.left >= nodeScreenRight) return;
+                        if (r.bottom <= nodeScreenTop || r.top >= nodeScreenBottom) return;
+                        const sr = toScreenshotRect(r);
+                        const isSvg = el.tagName?.toLowerCase() === 'svg';
+                        draws.push({ type: isSvg ? 'svg' : 'image', el: el, x: sr.x, y: sr.y, w: sr.w, h: sr.h });
+                    } catch (_) {}
+                });
+            };
+
+            const collectTextDraws = (el, draws) => {
+                if (!el || !(el instanceof HTMLElement)) return;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return;
+                if (rect.right <= nodeScreenLeft || rect.left >= nodeScreenRight) return;
+                if (rect.bottom <= nodeScreenTop || rect.top >= nodeScreenBottom) return;
+                const style = window.getComputedStyle(el);
+                let value = "";
+                if (el instanceof HTMLInputElement) {
+                    if (!['checkbox', 'radio', 'color', 'range'].includes(el.type)) value = el.value;
+                } else if (el instanceof HTMLTextAreaElement) {
+                    value = el.value;
+                } else if (el instanceof HTMLSelectElement) {
+                    value = el.selectedOptions?.[0]?.textContent || "";
+                } else if (el.children.length === 0) {
+                    value = el.textContent || "";
+                }
+                value = value.replace(/\s+/g, " ").trim();
+                if (value && style.visibility !== 'hidden' && style.display !== 'none') {
+                    const sr = toScreenshotRect(rect);
+                    draws.push({
+                        ...sr,
+                        value,
+                        color: style.color || '#ddd',
+                        fontSize: (parseFloat(style.fontSize) || 12) * cssToPxY,
+                        fontFamily: style.fontFamily || 'sans-serif',
+                        fontWeight: style.fontWeight || '400',
+                        align: style.textAlign || 'left',
+                        paddingLeft: (parseFloat(style.paddingLeft) || 0) * cssToPxX,
+                        paddingRight: (parseFloat(style.paddingRight) || 0) * cssToPxX
+                    });
+                }
+                for (const child of el.children) collectTextDraws(child, draws);
+            };
+
+            const bgDraws = [];
+            const imageDraws = [];
+            const textDraws = [];
+            const handledWidgets = new Set();
+
+            for (const node of selectedNodes) {
+                if (node.widgets && node.widgets.length) {
+                    for (const w of node.widgets) {
+                        if (w && w.element && w.element instanceof HTMLElement) {
+                            if (handledWidgets.has(w.element)) continue;
+                            handledWidgets.add(w.element);
+                            const r = w.element.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                                collectBgDraws(w.element, bgDraws);
+                                collectImageDraws(w.element, imageDraws);
+                                collectTextDraws(w.element, textDraws);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (const d of bgDraws) {
+                try { ctx.fillStyle = d.color; ctx.fillRect(d.x, d.y, d.w, d.h); } catch (_) {}
+            }
+
+            // SVG 转图像辅助函数
+            const svgToImageWf = (svgEl) => {
+                try {
+                    const clone = svgEl.cloneNode(true);
+                    const rect = svgEl.getBoundingClientRect();
+                    if (!clone.getAttribute('width')) clone.setAttribute('width', rect.width);
+                    if (!clone.getAttribute('height')) clone.setAttribute('height', rect.height);
+                    if (!clone.getAttribute('viewBox') && rect.width && rect.height) {
+                        clone.setAttribute('viewBox', `0 0 ${rect.width} ${rect.height}`);
+                    }
+                    const style = window.getComputedStyle(svgEl);
+                    const svgStr = new XMLSerializer().serializeToString(clone);
+                    const coloredSvg = svgStr.replace(/currentColor/g, style.color || '#ccc');
+                    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(coloredSvg);
+                } catch (e) {
+                    return null;
+                }
+            };
+
+            for (const d of imageDraws) {
+                if (d.type === 'svg') {
+                    const dataUrl = svgToImageWf(d.el);
+                    if (dataUrl) {
+                        const img = new Image();
+                        const loaded = await new Promise(resolve => {
+                            img.onload = () => resolve(true);
+                            img.onerror = () => resolve(false);
+                            img.src = dataUrl;
+                        });
+                        if (loaded) ctx.drawImage(img, d.x, d.y, d.w, d.h);
+                    }
+                } else {
+                    try { ctx.drawImage(d.el, d.x, d.y, d.w, d.h); } catch (_) {}
+                }
+            }
+
+            // 全局补充查找
+            const globalImgs = document.querySelectorAll('img, canvas, svg');
+            for (const el of globalImgs) {
+                if (el === sourceCanvas || el.id === 'graph-canvas') continue;
+                let alreadyHandled = false;
+                for (const wEl of handledWidgets) {
+                    if (wEl.contains(el)) { alreadyHandled = true; break; }
+                }
+                if (alreadyHandled) continue;
+                try {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    if (rect.right <= nodeScreenLeft || rect.left >= nodeScreenRight) continue;
+                    if (rect.bottom <= nodeScreenTop || rect.top >= nodeScreenBottom) continue;
+                    const sr = toScreenshotRect(rect);
+                    const isSvg = el.tagName?.toLowerCase() === 'svg';
+                    if (isSvg) {
+                        const dataUrl = svgToImageWf(el);
+                        if (dataUrl) {
+                            const img = new Image();
+                            const loaded = await new Promise(resolve => {
+                                img.onload = () => resolve(true);
+                                img.onerror = () => resolve(false);
+                                img.src = dataUrl;
+                            });
+                            if (loaded) ctx.drawImage(img, sr.x, sr.y, sr.w, sr.h);
+                        }
+                    } else {
+                        ctx.drawImage(el, sr.x, sr.y, sr.w, sr.h);
+                    }
+                } catch (_) {}
+            }
+
+            for (const d of textDraws) {
+                ctx.fillStyle = d.color;
+                ctx.font = `${d.fontWeight} ${d.fontSize}px ${d.fontFamily}`;
+                ctx.textBaseline = 'middle';
+                let x = d.x + d.paddingLeft;
+                if (d.align === 'center') {
+                    ctx.textAlign = 'center';
+                    x = d.x + d.w / 2;
+                } else if (d.align === 'right' || d.align === 'end') {
+                    ctx.textAlign = 'right';
+                    x = d.x + d.w - d.paddingRight;
+                } else {
+                    ctx.textAlign = 'left';
+                }
+                ctx.fillText(d.value, x, d.y + d.h / 2, Math.max(1, d.w - d.paddingLeft - d.paddingRight));
+            }
+
+            return canvas.toDataURL("image/png");
+        } catch (e) {
+            console.warn("[Rui] 截图多节点失败:", e);
+            return null;
+        }
+    }
+
+    async _showPreview(item) {
+        if (!this._previewEl || !item) return;
+        if (this._previewHideTimer) { clearTimeout(this._previewHideTimer); this._previewHideTimer = null; }
+        const isWorkflow = item.dataset.kind === "workflow";
+        const previewKey = isWorkflow ? ("wf_" + item.dataset.wfId) : item.dataset.type;
+        if (this._previewEl.dataset.currentType === previewKey) return;
+
+        const token = ++this._previewToken;
+        const rect = item.getBoundingClientRect();
+        let dataUrl = this._previewCanvasCache.get(previewKey);
+
+        if (!dataUrl) {
+            dataUrl = await this._getPreviewImage(previewKey);
+            if (dataUrl) this._previewCanvasCache.set(previewKey, dataUrl);
+        }
+
+        if (token !== this._previewToken) return;
+
+        if (dataUrl) {
+            const img = document.createElement("img");
+            img.src = dataUrl;
+            img.style.cssText = "display:block;max-width:320px;border-radius:6px;border:2px solid #4CAF50;box-shadow:0 4px 16px rgba(0,0,0,0.6);";
+            img.draggable = false;
+            this._previewEl.innerHTML = "";
+            this._previewEl.appendChild(img);
+            img.onload = () => this._positionPreview(rect);
+            img.onerror = () => this._positionPreview(rect);
+        } else {
+            const tip = ruiT('暂无预览截图，取消收藏，重新收藏即可解决','No preview screenshot. Unfavorite then favorite again to fix.');
+            this._previewEl.innerHTML = `<div style="padding:10px 14px;background:#1a1a1a;border:2px solid #4CAF50;border-radius:6px;color:#888;font-size:12px;white-space:nowrap;">${tip}</div>`;
+        }
+        this._previewEl.dataset.currentType = previewKey;
+        this._positionPreview(rect);
+    }
+
+    _positionPreview(rect) {
+        if (!this._previewEl) return;
+        this._previewEl.style.display = "block";
+        this._previewEl.style.visibility = "hidden";
+
+        const pw = this._previewEl.offsetWidth || 320;
+        const ph = this._previewEl.offsetHeight || 200;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const margin = 8;
+
+        let left, top;
+        if (this.panel) {
+            const pr = this.panel.getBoundingClientRect();
+            const panelCenter = (pr.left + pr.right) / 2;
+
+            // 判断收藏栏在左侧还是右侧，预览放到其相反侧并贴紧
+            if (panelCenter < vw / 2) {
+                // 收藏栏在左，预览放右边
+                left = pr.right + margin;
+                if (left + pw > vw) {
+                    left = Math.max(margin, pr.left - margin - pw);
+                }
+            } else {
+                // 收藏栏在右，预览放左边
+                left = pr.left - margin - pw;
+                if (left < margin) {
+                    left = Math.max(margin, pr.right + margin);
+                }
+            }
+
+            // 高度方向与收藏栏上边缘对齐
+            top = pr.top;
+        } else {
+            left = Math.round((vw - pw) / 2);
+            top = Math.round((vh - ph) / 2);
+        }
+
+        if (left + pw > vw) left = vw - pw - margin;
+        if (left < margin) left = margin;
+        if (top + ph > vh) top = vh - ph - margin;
+        if (top < margin) top = margin;
+
+        this._previewEl.style.left = left + "px";
+        this._previewEl.style.top = top + "px";
+        this._previewEl.style.visibility = "visible";
+    }
+
+
+
+
+    _hidePreview(delay = 250) {
+        if (!this._previewEl) return;
+        if (this._previewHideTimer) clearTimeout(this._previewHideTimer);
+        this._previewHideTimer = setTimeout(() => {
+            this._previewEl.style.display = "none";
+            this._previewEl.dataset.currentType = "";
+        }, delay);
+    }
+
+    moveFavorite(nodeType, offset) {
+        const nodes = this.getFilteredFavorites();
+        const idx = nodes.findIndex(n => n.type === nodeType);
+        if (idx < 0) return;
+        const newIdx = idx + offset;
+        if (newIdx < 0 || newIdx >= nodes.length) return;
+        const moved = nodes.splice(idx, 1)[0];
+        nodes.splice(newIdx, 0, moved);
+        nodes.forEach((n, i) => n.order = i);
+        this.saveFavorites();
+        this.renderFavorites();
+    }
+
+    startReorderDrag(item, clientY) {
+        this._reorderData = {
+            item: item,
+            nodeType: item.dataset.type,
+            startY: clientY,
+            originalIndex: Array.from(this.favoritesList.children).indexOf(item)
+        };
+        item.classList.add("nf-reorder-dragging");
+        document.addEventListener("mousemove", this._onReorderMove = (e) => this.onReorderMove(e));
+        document.addEventListener("mouseup", this._onReorderEnd = (e) => this.endReorderDrag());
+    }
+
+    onReorderMove(e) {
+        if (!this._reorderData || !this.favoritesList) return;
+
+        const items = Array.from(this.favoritesList.querySelectorAll(".nf-fav-item:not(.nf-reorder-dragging)"));
+        const draggingItem = this._reorderData.item;
+        const mouseY = e.clientY;
+
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const rect = item.getBoundingClientRect();
+            const itemMidY = rect.top + rect.height / 2;
+            if (mouseY < itemMidY) {
+                this.favoritesList.insertBefore(draggingItem, item);
+                return;
+            }
+        }
+        this.favoritesList.appendChild(draggingItem);
+    }
+
+    endReorderDrag() {
+        if (!this._reorderData) return;
+
+        const item = this._reorderData.item;
+        const nodeType = this._reorderData.nodeType;
+        item.classList.remove("nf-reorder-dragging");
+
+        const items = Array.from(this.favoritesList.querySelectorAll(".nf-fav-item"));
+        const newIndex = items.indexOf(item);
+
+        const categoryId = this.currentCategory === "all" ? null : this.currentCategory;
+        let catNodes = this.favorites.nodes;
+        if (categoryId) {
+            catNodes = catNodes.filter(n => n.categoryId === categoryId);
+        }
+
+        const sortMode = this.favorites.sortMode || "default";
+        if (sortMode === "default") {
+            catNodes.sort((a, b) => (a.order || 0) - (b.order || 0));
+        } else {
+            catNodes.sort((a, b) => {
+                if ((b.lastUsed || 0) !== (a.lastUsed || 0)) return (b.lastUsed || 0) - (a.lastUsed || 0);
+                return (a.order || 0) - (b.order || 0);
+            });
+        }
+
+        const draggedNode = this.favorites.nodes.find(n => n.type === nodeType);
+        if (!draggedNode) {
+            this._reorderData = null;
+            return;
+        }
+
+        if (newIndex === 0) {
+            if (items.length > 1) {
+                const nextNode = this.favorites.nodes.find(n => n.type === items[1].dataset.type);
+                draggedNode.order = (nextNode?.order || 1000) - 1000;
+            } else {
+                draggedNode.order = 1000;
+            }
+        } else if (newIndex === items.length - 1) {
+            const prevNode = this.favorites.nodes.find(n => n.type === items[items.length - 2].dataset.type);
+            draggedNode.order = (prevNode?.order || 0) + 1000;
+        } else {
+            const prevNode = this.favorites.nodes.find(n => n.type === items[newIndex - 1].dataset.type);
+            const nextNode = this.favorites.nodes.find(n => n.type === items[newIndex + 1].dataset.type);
+            const prevOrder = prevNode?.order || 0;
+            const nextOrder = nextNode?.order || (prevOrder + 2000);
+            draggedNode.order = (prevOrder + nextOrder) / 2;
+        }
+
+        this.saveFavorites();
+        this.renderFavorites();
+
+        document.removeEventListener("mousemove", this._onReorderMove);
+        document.removeEventListener("mouseup", this._onReorderEnd);
+        this._reorderData = null;
+    }
+
+    addNodeToCanvas(nodeType) {
+        this.recordUse(nodeType);
+        try {
+            const node = LiteGraph.createNode(nodeType);
+            if (!node) {
+                console.error(`无法创建节点: ${nodeType}`);
+                return;
+            }
+
+            const canvas = app.canvas;
+            if (!canvas || !app.graph) {
+                console.error("画布或图未初始化");
+                return;
+            }
+
+            const graph = app.graph;
+
+            const viewCenterX = canvas.canvas.width / canvas.ds.scale / 2 - canvas.ds.offset[0];
+            const viewCenterY = canvas.canvas.height / canvas.ds.scale / 2 - canvas.ds.offset[1];
+            node.pos = [viewCenterX, viewCenterY];
+
+            graph.add(node);
+            canvas.setDirty(true, true);
+
+            if (node.onAdded) {
+                node.onAdded();
+            }
+
+            app.graph.change();
+        } catch (e) {
+            console.error("添加节点到画布失败:", e);
+        }
+    }
+
+    showAddCategoryDialog() {
+        const name = prompt("请输入分类名称：");
+        if (!name || !name.trim()) return;
+
+        const id = "cat_" + Date.now();
+        const maxOrder = this.favorites.categories.reduce((max, c) => Math.max(max, c.order || 0), 0);
+        this.favorites.categories.push({
+            id: id,
+            name: name.trim(),
+            order: maxOrder + 1
+        });
+
+        this.saveFavorites();
+        this.renderCategories();
+    }
+
+    showEditCategoryDialog(catId) {
+        const cat = this.getCategoryById(catId);
+        if (!cat) return;
+
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">编辑分类</div>
+                <div class="nf-dialog-body">
+                    <div class="nf-form-item">
+                        <label>分类名称：</label>
+                        <input type="text" id="nf-cat-name-input" value="${cat.name}" />
+                    </div>
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => {
+            dialog.remove();
+        });
+
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", () => {
+            const name = dialog.querySelector("#nf-cat-name-input").value.trim();
+            if (!name) {
+                alert(ruiT('请输入分类名称！','Please enter a category name!'));
+                return;
+            }
+            cat.name = name;
+            this.saveFavorites();
+            this.renderCategories();
+            this.renderFavorites();
+            dialog.remove();
+        });
+
+        dialog.addEventListener("mousedown", (e) => {
+            if (e.target === dialog) {
+                dialog.remove();
+            }
+        });
+    }
+
+    deleteCategory(catId) {
+        this.favorites.nodes.forEach(n => {
+            if (n.categoryId === catId) {
+                n.categoryId = "default";
+            }
+        });
+
+        this.favorites.categories = this.favorites.categories.filter(c => c.id !== catId);
+
+        if (this.currentCategory === catId) {
+            this.currentCategory = "all";
+        }
+
+        this.saveFavorites();
+        this.renderCategories();
+        this.renderFavorites();
+    }
+
+    moveCategory(catId, offset) {
+        const cats = this.favorites.categories;
+        const idx = cats.findIndex(c => c.id === catId);
+        if (idx < 0) return;
+        const newIdx = idx + offset;
+        if (newIdx < 0 || newIdx >= cats.length) return;
+        // 交换数组元素位置
+        [cats[idx], cats[newIdx]] = [cats[newIdx], cats[idx]];
+        // 重新赋予连续的 order 值，使排序顺序与数组顺序一致
+        cats.forEach((cat, i) => cat.order = (i + 1) * 1000);
+        this.saveFavorites();
+        this.renderCategories();
+    }
+
+    reorderCategory(dragCatId, targetCatId) {
+        const cats = this.favorites.categories;
+        const fromIdx = cats.findIndex(c => c.id === dragCatId);
+        const toIdx = cats.findIndex(c => c.id === targetCatId);
+        if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
+        // 将拖动的分类插入到目标分类之前
+        const [moved] = cats.splice(fromIdx, 1);
+        cats.splice(toIdx, 0, moved);
+        // 重新赋予连续的 order 值
+        cats.forEach((cat, i) => cat.order = (i + 1) * 1000);
+        this.saveFavorites();
+        this.renderCategories();
+    }
+
+    reorderCategoryToIndex(dragCatId, insertIndex) {
+        const cats = this.favorites.categories;
+        const fromIdx = cats.findIndex(c => c.id === dragCatId);
+        if (fromIdx < 0) return;
+        // 将 insertIndex 由“原数组位置”换算为“移除后的目标位置”
+        let to = fromIdx < insertIndex ? insertIndex - 1 : insertIndex;
+        if (to === fromIdx) { this.renderCategories(); return; }
+        const [moved] = cats.splice(fromIdx, 1);
+        cats.splice(to, 0, moved);
+        cats.forEach((cat, i) => cat.order = (i + 1) * 1000);
+        this.saveFavorites();
+        this.renderCategories();
+    }
+
+    _showCatInsertIndicator(insertIndex) {
+        this._removeCatInsertIndicator();
+        if (!this.categoryList) return;
+        const indicator = document.createElement("div");
+        indicator.className = "nf-cat-insert-indicator";
+        // DOM 中首个子项是“全部”，真实分类从索引 1 开始
+        const domIndex = insertIndex + 1;
+        const refNode = this.categoryList.children[domIndex] || null;
+        this.categoryList.insertBefore(indicator, refNode);
+    }
+
+    _removeCatInsertIndicator() {
+        if (this.categoryList) {
+            const el = this.categoryList.querySelector(".nf-cat-insert-indicator");
+            if (el) el.remove();
+        }
+    }
+
+    showAddToCategoryDialog(node) {
+        const cats = this.favorites.categories;
+        let optionsHTML = "";
+        for (const cat of cats) {
+            optionsHTML += `<option value="${cat.id}">${cat.name}</option>`;
+        }
+
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">收藏到分类</div>
+                <div class="nf-dialog-body">
+                    <label>选择分类：</label>
+                    <select id="nf-cat-select">${optionsHTML}</select>
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => {
+            dialog.remove();
+        });
+
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", () => {
+            const catId = dialog.querySelector("#nf-cat-select").value;
+            this.addFavorite(node, catId);
+            dialog.remove();
+        });
+
+        dialog.addEventListener("mousedown", (e) => {
+            if (e.target === dialog) {
+                dialog.remove();
+            }
+        });
+    }
+
+    showBatchAddToCategoryDialog(nodes) {
+        if (!nodes || nodes.length === 0) return;
+
+        const cats = this.favorites.categories;
+        let optionsHTML = "";
+        for (const cat of cats) {
+            optionsHTML += `<option value="${cat.id}">${cat.name}</option>`;
+        }
+
+        const count = nodes.length;
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">批量收藏 (${count}个节点)</div>
+                <div class="nf-dialog-body">
+                    <label>选择分类：</label>
+                    <select id="nf-cat-select">${optionsHTML}</select>
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => {
+            dialog.remove();
+        });
+
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", () => {
+            const catId = dialog.querySelector("#nf-cat-select").value;
+            let added = 0;
+            for (const node of nodes) {
+                if (!this.isNodeFavorited(node.type)) {
+                    this.addFavorite(node, catId);
+                    added++;
+                }
+            }
+            dialog.remove();
+            if (added > 0) {
+                this.renderFavorites();
+                this.renderCategories();
+            }
+        });
+
+        dialog.addEventListener("mousedown", (e) => {
+            if (e.target === dialog) {
+                dialog.remove();
+            }
+        });
+    }
+
+    showMoveNodeCategoryDialog(nodeType) {
+        const node = this.favorites.nodes.find(n => n.type === nodeType);
+        if (!node) return;
+        const nodeName = node.displayName || nodeType;
+
+        const cats = this.favorites.categories;
+        let optionsHTML = "";
+        for (const cat of cats) {
+            const selected = cat.id === node.categoryId ? "selected" : "";
+            optionsHTML += `<option value="${cat.id}" ${selected}>${cat.name}</option>`;
+        }
+
+        const dialog = document.createElement("div");
+        dialog.className = "nf-dialog-overlay";
+        dialog.innerHTML = `
+            <div class="nf-dialog">
+                <div class="nf-dialog-title">移动"${nodeName}"到分类</div>
+                <div class="nf-dialog-body">
+                    <label>选择分类：</label>
+                    <select id="nf-cat-select">${optionsHTML}</select>
+                </div>
+                <div class="nf-dialog-footer">
+                    <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                    <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+
+        dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => {
+            dialog.remove();
+        });
+
+        dialog.querySelector("#nf-dlg-ok").addEventListener("click", () => {
+            const catId = dialog.querySelector("#nf-cat-select").value;
+            this.moveNodeToCategory(nodeType, catId);
+            dialog.remove();
+        });
+
+        dialog.addEventListener("mousedown", (e) => {
+            if (e.target === dialog) {
+                dialog.remove();
+            }
+        });
+    }
+
+    /* ── Rui标题节点创建拦截 ── */
+    _patchRuiTitleCreate() {
+        try {
+            if (typeof LiteGraph === 'undefined' || !LiteGraph.createNode) {
+                setTimeout(() => this._patchRuiTitleCreate(), 100);
+                return;
+            }
+            const origCreate = LiteGraph.createNode;
+            LiteGraph.createNode = function(type, title, options) {
+                // 必须透传 options，否则刷新节点（reloadNode）等依赖
+                // LiteGraph.createNode(type, title, {pos, size, ...}) 的功能
+                // 会因 options 丢失而把节点重置到默认位置（画布原点）
+                const node = origCreate.call(LiteGraph, type, title, options);
+                if (node && type === "RuiTitle") {
+                    if (!node.properties) node.properties = {};
+                    try {
+                        const stored = localStorage.getItem("rui_last_title_config");
+                        if (stored) {
+                            const config = JSON.parse(stored);
+                            if (config && typeof config === 'object') {
+                                delete config.text;
+                                Object.assign(node.properties, config);
+                            }
+                        }
+                    } catch (e) {}
+                }
+                return node;
+            };
+        } catch (e) {
+            console.warn('[Rui] createNode patch 失败，延迟重试:', e);
+            setTimeout(() => this._patchRuiTitleCreate(), 100);
+        }
+    }
+}
+
+app.registerExtension({
+    name: "ComfyUI.rui",
+
+    async setup() {
+        // 移除旧版 RuiSelector 的 DOM widget 处理，改为 Canvas 版
+        // 新版实现位于 web/rui_selector.js
+        // 这里仅注册扩展依赖，确保 node_favorites.js 依然加载，选择器功能由 rui_selector.js 接管
+
+        if (nodeFavoritesInstance) return;
+
+        nodeFavoritesInstance = new Rui();
+        window.ruiFavorites = nodeFavoritesInstance;
+
+        // 语言切换时刷新面板文案（双语支持）
+        try {
+            const lookup = app?.ui?.settings?.settingsLookup?.["Comfy.Locale"];
+            if (lookup && !lookup.__rui_fav_hooked) {
+                lookup.__rui_fav_hooked = true;
+                const orig = lookup.onChange;
+                lookup.onChange = function () {
+                    try {
+                        nodeFavoritesInstance.renderFavorites();
+                        nodeFavoritesInstance.renderCategories();
+                        nodeFavoritesInstance.refreshStaticLabels();
+                    } catch (e) {}
+                    return orig?.apply(this, arguments);
+                };
+            }
+        } catch (e) {}
+
+        const origDrawNode = LGraphCanvas.prototype.drawNode;
+        LGraphCanvas.prototype.drawNode = function(node, ctx) {
+            if (node.type === "RuiTitle") {
+                const cv = app.canvas || LGraphCanvas.active_canvas;
+                node.selected = !!(cv?.selected_nodes?.[node.id]);
+                node.bgcolor = "transparent";
+                node.color = "#fff0";
+                node.resizable = true;
+                node.flags = node.flags || {};
+                node.flags.resizable = true;
+                if (node.onDrawBackground) {
+                    node.onDrawBackground(ctx);
+                }
+                return;
+            }
+            origDrawNode.call(this, node, ctx);
+        };
+    },
+
+    beforeRegisterNodeDef(nodeType, nodeData, app) {
+        if (nodeData.name === "RuiDuplicateFirstFrame") {
+            const translatedName = ruiT("Rui帧优化", "Rui Frame Optimization");
+            nodeType.title = translatedName;
+            nodeData.display_name = translatedName;
+
+            if (nodeData.inputs) {
+                if (nodeData.inputs.image) {
+                    nodeData.inputs.image.name = ruiT("图像", "image");
+                }
+                if (nodeData.inputs.multi_fill) {
+                    nodeData.inputs.multi_fill.name = ruiT("多参补帧", "multi fill");
+                }
+            }
+            if (nodeData.outputs) {
+                for (const out of nodeData.outputs) {
+                    if (out.name === "image") {
+                        out.name = ruiT("图像", "image");
+                    } else if (out.name === "frame_count") {
+                        out.name = ruiT("实际帧数", "frame count");
+                    } else if (out.name === "original_count") {
+                        out.name = ruiT("原始帧数", "original count");
+                    } else if (out.name === "front_fill") {
+                        out.name = ruiT("前补帧", "front fill");
+                    } else if (out.name === "back_fill") {
+                        out.name = ruiT("后补帧", "back fill");
+                    } else if (out.name === "first_frame") {
+                        out.name = ruiT("首帧", "first frame");
+                    } else if (out.name === "last_frame") {
+                        out.name = ruiT("尾帧", "last frame");
+                    }
+                }
+            }
+            if (nodeData.output_name) {
+                nodeData.output_name = nodeData.output_name.map(n => {
+                    if (n === "image") return ruiT("图像", "image");
+                    if (n === "frame_count") return ruiT("实际帧数", "frame count");
+                    if (n === "original_count") return ruiT("原始帧数", "original count");
+                    if (n === "front_fill") return ruiT("前补帧", "front fill");
+                    if (n === "back_fill") return ruiT("后补帧", "back fill");
+                    if (n === "first_frame") return ruiT("首帧", "first frame");
+                    if (n === "last_frame") return ruiT("尾帧", "last frame");
+                    return n;
+                });
+            }
+
+            const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                if (origOnNodeCreated) origOnNodeCreated.apply(this, arguments);
+                const w = this.widgets?.find(w => w.name === "multi_fill");
+                if (w) {
+                    w.label = ruiT("多参补帧", "multi fill");
+                }
+                if (this.inputs) {
+                    for (const inp of this.inputs) {
+                        if (inp.name === "image") {
+                            inp.label = ruiT("图像", "image");
+                        }
+                    }
+                }
+                if (this.outputs) {
+                    for (const out of this.outputs) {
+                        if (out.name === "image") {
+                            out.label = ruiT("图像", "image");
+                        } else if (out.name === "frame_count") {
+                            out.label = ruiT("实际帧数", "frame count");
+                        } else if (out.name === "original_count") {
+                            out.label = ruiT("原始帧数", "original count");
+                        } else if (out.name === "front_fill") {
+                            out.label = ruiT("前补帧", "front fill");
+                        } else if (out.name === "back_fill") {
+                            out.label = ruiT("后补帧", "back fill");
+                        } else if (out.name === "first_frame") {
+                            out.label = ruiT("首帧", "first frame");
+                        } else if (out.name === "last_frame") {
+                            out.label = ruiT("尾帧", "last frame");
+                        }
+                    }
+                }
+            };
+        }
+        if (nodeData.name === "RuiFrameExtract") {
+            const translatedName = ruiT("Rui帧提取", "Rui Frame Extract");
+            nodeType.title = translatedName;
+            nodeData.display_name = translatedName;
+
+            if (nodeData.inputs) {
+                if (nodeData.inputs.image) {
+                    nodeData.inputs.image.name = ruiT("图像", "image");
+                }
+                if (nodeData.inputs.front_fill) {
+                    nodeData.inputs.front_fill.name = ruiT("前补帧", "front fill");
+                }
+                if (nodeData.inputs.back_fill) {
+                    nodeData.inputs.back_fill.name = ruiT("后补帧", "back fill");
+                }
+                if (nodeData.inputs.mask) {
+                    nodeData.inputs.mask.name = ruiT("遮罩", "mask");
+                }
+            }
+            if (nodeData.outputs) {
+                for (const out of nodeData.outputs) {
+                    if (out.name === "image") {
+                        out.name = ruiT("图像", "image");
+                    } else if (out.name === "mask") {
+                        out.name = ruiT("遮罩", "mask");
+                    }
+                }
+            }
+            if (nodeData.output_name) {
+                nodeData.output_name = nodeData.output_name.map(n => {
+                    if (n === "image") return ruiT("图像", "image");
+                    if (n === "mask") return ruiT("遮罩", "mask");
+                    return n;
+                });
+            }
+
+            const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                if (origOnNodeCreated) origOnNodeCreated.apply(this, arguments);
+                if (this.inputs) {
+                    for (const inp of this.inputs) {
+                        if (inp.name === "image") {
+                            inp.label = ruiT("图像", "image");
+                        } else if (inp.name === "front_fill") {
+                            inp.label = ruiT("前补帧", "front fill");
+                        } else if (inp.name === "back_fill") {
+                            inp.label = ruiT("后补帧", "back fill");
+                        } else if (inp.name === "mask") {
+                            inp.label = ruiT("遮罩", "mask");
+                        }
+                    }
+                }
+                if (this.outputs) {
+                    for (const out of this.outputs) {
+                        if (out.name === "image") {
+                            out.label = ruiT("图像", "image");
+                        } else if (out.name === "mask") {
+                            out.label = ruiT("遮罩", "mask");
+                        }
+                    }
+                }
+            };
+        }
+        if (nodeData.name === "RuiSelector") {
+            // 选择器 Canvas 绘制版已迁移到 rui_selector.js
+            // 这里仅保留设置对话框和右键菜单，DOM widget 创建逻辑已移除
+            const DEFAULT_COUNT = 2;
+            const DEFAULT_COLUMNS = DEFAULT_COUNT;
+            const DEFAULT_BTN_WIDTH = 60;
+            const DEFAULT_BTN_HEIGHT = 30;
+            const DEFAULT_FONT_SIZE = 12;
+            const DEFAULT_BTN_GAP = 4;
+            const DEFAULT_FONT_COLOR = "#FFFFFF";
+            const DEFAULT_COLORS = {
+                color1: "#000000",
+                color2: "#FF0000",
+                color3: "#000000",
+                direction: "180deg"
+            };
+            const DEFAULT_SETTINGS = {
+                labels: {"0": "", "1": ""},
+                colors: { ...DEFAULT_COLORS },
+                count: DEFAULT_COUNT,
+                columns: DEFAULT_COLUMNS,
+                btnWidth: DEFAULT_BTN_WIDTH,
+                btnHeight: DEFAULT_BTN_HEIGHT,
+                fontSize: DEFAULT_FONT_SIZE,
+                btnGap: DEFAULT_BTN_GAP,
+                fontColor: DEFAULT_FONT_COLOR,
+                inactiveColor: "#2a2a2a",
+                scaleMode: "auto",
+                contentScale: 1,
+                widths: {}
+            };
+
+            function getNodeSettings(node) {
+                try {
+                    const sw = node.widgets?.find(w => w.name === "_rui_settings");
+                    if (sw && sw.value) {
+                        const parsed = JSON.parse(sw.value);
+                        const settings = { ...DEFAULT_SETTINGS, ...parsed };
+                        const max = Math.max(1, settings.count);
+                        settings.columns = Math.max(1, Math.min(settings.columns, max));
+                        if (!settings.widths || typeof settings.widths !== "object") {
+                            settings.widths = {};
+                        }
+                        return settings;
+                    }
+                } catch (e) {}
+                const settings = { ...DEFAULT_SETTINGS };
+                const max = Math.max(1, settings.count);
+                settings.columns = Math.max(1, Math.min(settings.columns, max));
+                return settings;
+            }
+
+            function setNodeSettings(node, settings) {
+                try {
+                    const sw = node.widgets?.find(w => w.name === "_rui_settings");
+                    if (sw) {
+                        sw.value = JSON.stringify(settings);
+                    }
+                } catch (e) {}
+            }
+
+            function loadCount(node) { return getNodeSettings(node).count; }
+            function loadLabels(node) { return getNodeSettings(node).labels; }
+            function loadColors(node) { return getNodeSettings(node).colors; }
+            function loadColumns(node) { return getNodeSettings(node).columns; }
+
+            function getDisplayLabel(value, labels) {
+                if (labels[value] && labels[value].trim()) {
+                    return labels[value];
+                }
+                return value;
+            }
+
+            function buildLabelsHTML(labels, widths, count, defaultWidth) {
+                let html = "";
+                for (let i = 0; i < count; i++) {
+                    const w = widths[String(i)] !== undefined ? widths[String(i)] : defaultWidth;
+                    html += `
+                        <div class="nf-form-item" data-label-item="${i}" style="margin-bottom: 10px; padding: 8px; background: #1a1a1a; border-radius: 6px;">
+                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                                <span style="font-size: 12px; color: #FFD700; width: 50px; white-space: nowrap;">${ruiT('标签','Label')}${i + 1}</span>
+                                <input type="text" id="nf-label-${i}" value="${labels[String(i)] || ""}" placeholder="${ruiT('留空显示','Empty → shows')} ${i}" style="flex: 1; padding: 4px 8px; border-radius: 4px; border: 1px solid #444; background: #222; color: #ddd; font-size: 13px;" />
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 11px; color: #888; width: 50px; white-space: nowrap;">${ruiT('基础宽度','Base width')}</span>
+                                <input type="range" id="nf-label-width-${i}" min="55" max="300" value="${w}" style="flex: 1; height: 12px;" />
+                                <span id="nf-label-width-val-${i}" style="font-size: 11px; color: #888; width: 40px; text-align: right;">${w}px</span>
+                            </div>
+                        </div>`;
+                }
+                return html;
+            }
+
+            function getMinBtnWidth(columns) {
+                if (columns === 1) return 130;
+                if (columns === 2) return 65;
+                return 55;
+            }
+
+
+
+            function showLabelsSettingsDialog(node, onSaved) {
+                const settings = getNodeSettings(node);
+                const originalSize = node.size ? [node.size[0], node.size[1]] : null;
+                const labels = settings.labels;
+                const colors = settings.colors;
+                const count = settings.count;
+                const dialog = document.createElement("div");
+                dialog.className = "nf-dialog-overlay";
+                dialog.style.cssText = `
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    z-index: 9999;
+                    background: transparent;
+                    pointer-events: none;
+                `;
+                dialog.innerHTML = `
+                    <div class="nf-dialog nf-selector-settings-dialog" style="pointer-events: auto; max-height: 85vh; width: 380px; margin: 0; display: flex; flex-direction: column; position: absolute; top: 50%; right: 20px; transform: translateY(-50%);">
+                        <div class="nf-dialog-title nf-dialog-drag-handle" style="cursor: move;">${ruiT('设置标签','Label Settings')}</div>
+                        <div class="nf-dialog-body" style="overflow-y: auto; padding: 12px 16px; max-height: 520px;">
+                            <div class="nf-form-item" style="margin-bottom: 10px;">
+                                <label>${ruiT('标签颜色与方向：','Label color & direction:')}</label>
+                                <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+                                    <input type="color" id="nf-color-1" value="${colors.color1}" style="width: 28px; height: 28px; padding: 2px; border: 1px solid #444; border-radius: 4px; background: #2a2a2a; cursor: pointer;" title="${ruiT('颜色','Color')} 1" />
+                                    <input type="color" id="nf-color-2" value="${colors.color2}" style="width: 28px; height: 28px; padding: 2px; border: 1px solid #444; border-radius: 4px; background: #2a2a2a; cursor: pointer;" title="${ruiT('颜色','Color')} 2" />
+                                    <input type="color" id="nf-color-3" value="${colors.color3}" style="width: 28px; height: 28px; padding: 2px; border: 1px solid #444; border-radius: 4px; background: #2a2a2a; cursor: pointer;" title="${ruiT('颜色','Color')} 3" />
+                                    <select id="nf-color-direction" style="width: 60px; height: 28px; padding: 2px 6px; border: 1px solid #444; border-radius: 4px; background: #2a2a2a; color: #ddd; font-size: 16px; text-align: center;" title="${ruiT('渐变方向','Gradient Direction')}">
+                                        <option value="90deg" ${colors.direction === '90deg' ? 'selected' : ''}>→</option>
+                                        <option value="180deg" ${colors.direction === '180deg' ? 'selected' : ''}>↓</option>
+                                        <option value="radial" ${colors.direction === 'radial' ? 'selected' : ''}>●</option>
+                                    </select>
+                                    <span style="display: flex; align-items: center; gap: 6px;">
+                                        <label style="font-size: 12px; color: #aaa;">${ruiT('标签底色：','Label background:')}</label>
+                                        <input type="color" id="nf-inactive-color" value="${settings.inactiveColor || '#2a2a2a'}" style="width: 28px; height: 28px; padding: 2px; border: 1px solid #444; border-radius: 4px; background: #2a2a2a; cursor: pointer;" title="${ruiT('标签底色','Label Background')}" />
+                                        <label style="font-size: 12px; color: #aaa;">${ruiT('文字颜色：','Text color:')}</label>
+                                        <input type="color" id="nf-font-color" value="${settings.fontColor || DEFAULT_FONT_COLOR}" style="width: 28px; height: 28px; padding: 2px; border: 1px solid #444; border-radius: 4px; background: #2a2a2a; cursor: pointer;" title="${ruiT('文字颜色','Text Color')}" />
+                                    </span>
+                                </div>
+                            </div>
+                            <div class="nf-form-item" style="margin-bottom: 10px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <label style="margin-bottom: 0; white-space: nowrap; width: 70px;">${ruiT('标签数量：','Label count:')}</label>
+                                    <input type="range" id="nf-label-count" min="2" max="10" value="${count}" style="flex: 1; height: 14px;" />
+                                    <span id="nf-count-value" style="font-size: 11px; color: #ddd; white-space: nowrap; min-width: 24px; text-align: right;">${count}</span>
+                                </div>
+                            </div>
+                            <div class="nf-form-item" style="margin-bottom: 10px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <label style="margin-bottom: 0; white-space: nowrap; width: 70px;">${ruiT('每行列数：','Columns per row:')}</label>
+                                    <input type="range" id="nf-columns" min="1" max="${count}" value="${loadColumns(node)}" style="flex: 1; height: 14px;" />
+                                    <span id="nf-columns-value" style="font-size: 11px; color: #ddd; white-space: nowrap; min-width: 24px; text-align: right;">${loadColumns(node)}</span>
+                                </div>
+                            </div>
+                            <div class="nf-form-item" style="margin-bottom: 10px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <label style="margin-bottom: 0; white-space: nowrap; width: 70px;">${ruiT('缩放模式：','Scale mode:')}</label>
+                                    <select id="nf-scale-mode" style="flex:1;height:28px;padding:2px 6px;border:1px solid #444;border-radius:4px;background:#2a2a2a;color:#ddd;">
+                                        <option value="auto" ${settings.scaleMode !== 'fixed' ? 'selected' : ''}>${ruiT('随节点自适应','Fit to node')}</option>
+                                        <option value="fixed" ${settings.scaleMode === 'fixed' ? 'selected' : ''}>${ruiT('固定倍率','Fixed scale')}</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="nf-form-item" id="nf-content-scale-row" style="margin-bottom: 10px;${settings.scaleMode === 'fixed' ? '' : 'opacity:0.45;'}">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <label style="margin-bottom: 0; white-space: nowrap; width: 70px;">${ruiT('整体倍率：','Content scale:')}</label>
+                                    <input type="range" id="nf-content-scale" min="0.5" max="3" step="0.05" value="${settings.contentScale || 1}" style="flex: 1; height: 14px;" ${settings.scaleMode === 'fixed' ? '' : 'disabled'} />
+                                    <span id="nf-content-scale-value" style="font-size: 11px; color: #ddd; white-space: nowrap; min-width: 36px; text-align: right;">${Number(settings.contentScale || 1).toFixed(2)}x</span>
+                                </div>
+                            </div>
+                            <div class="nf-form-item" style="margin-bottom: 10px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <label style="margin-bottom: 0; white-space: nowrap; width: 70px;">${ruiT('标签高度：','Label height:')}</label>
+                                    <input type="range" id="nf-btn-height" min="30" max="80" value="${settings.btnHeight || DEFAULT_BTN_HEIGHT}" style="flex: 1; height: 14px;" />
+                                    <span id="nf-btn-height-value" style="font-size: 11px; color: #ddd; white-space: nowrap; min-width: 24px; text-align: right;">${settings.btnHeight || DEFAULT_BTN_HEIGHT}</span>
+                                </div>
+                            </div>
+                            <div class="nf-form-item" style="margin-bottom: 10px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <label style="margin-bottom: 0; white-space: nowrap; width: 70px;">${ruiT('字体大小：','Font size:')}</label>
+                                    <input type="range" id="nf-font-size" min="10" max="24" value="${settings.fontSize || DEFAULT_FONT_SIZE}" style="flex: 1; height: 14px;" />
+                                    <span id="nf-font-size-value" style="font-size: 11px; color: #ddd; white-space: nowrap; min-width: 24px; text-align: right;">${settings.fontSize || DEFAULT_FONT_SIZE}</span>
+                                </div>
+                            </div>
+                            <div class="nf-form-item" style="margin-bottom: 10px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <label style="margin-bottom: 0; white-space: nowrap; width: 70px;">${ruiT('标签间距：','Label gap:')}</label>
+                                    <input type="range" id="nf-btn-gap" min="0" max="20" value="${settings.btnGap || DEFAULT_BTN_GAP}" style="flex: 1; height: 14px;" />
+                                    <span id="nf-btn-gap-value" style="font-size: 11px; color: #ddd; white-space: nowrap; min-width: 24px; text-align: right;">${settings.btnGap || DEFAULT_BTN_GAP}</span>
+                                </div>
+                            </div>
+                            <div id="nf-labels-container" style="padding-top: 4px;">
+                                ${buildLabelsHTML(labels, settings.widths || {}, count, settings.btnWidth || DEFAULT_BTN_WIDTH)}
+                            </div>
+                        </div>
+                        <div class="nf-dialog-footer">
+                            <button class="nf-btn nf-btn-cancel" id="nf-dlg-reset">${ruiT('恢复默认','Reset')}</button>
+                            <button class="nf-btn nf-btn-cancel" id="nf-dlg-cancel">${ruiT('取消','Cancel')}</button>
+                            <button class="nf-btn nf-btn-ok" id="nf-dlg-ok">${ruiT('确定','OK')}</button>
+                        </div>
+                    </div>
+                `;
+
+                document.body.appendChild(dialog);
+
+                const countSelect = dialog.querySelector("#nf-label-count");
+                const countValueEl = dialog.querySelector("#nf-count-value");
+                const labelsContainer = dialog.querySelector("#nf-labels-container");
+                const columnsInput = dialog.querySelector("#nf-columns");
+                const columnsValueEl = dialog.querySelector("#nf-columns-value");
+                const scaleModeInput = dialog.querySelector("#nf-scale-mode");
+                const contentScaleInput = dialog.querySelector("#nf-content-scale");
+                const contentScaleValueEl = dialog.querySelector("#nf-content-scale-value");
+                const contentScaleRow = dialog.querySelector("#nf-content-scale-row");
+                const colorDirectionInput = dialog.querySelector("#nf-color-direction");
+                const color1Input = dialog.querySelector("#nf-color-1");
+                const color2Input = dialog.querySelector("#nf-color-2");
+                const color3Input = dialog.querySelector("#nf-color-3");
+                const fontColorInput = dialog.querySelector("#nf-font-color");
+                const inactiveColorInput = dialog.querySelector("#nf-inactive-color");
+                const btnHeightInput = dialog.querySelector("#nf-btn-height");
+                const fontSizeInput = dialog.querySelector("#nf-font-size");
+                const btnGapInput = dialog.querySelector("#nf-btn-gap");
+                const btnHeightValueEl = dialog.querySelector("#nf-btn-height-value");
+                const fontSizeValueEl = dialog.querySelector("#nf-font-size-value");
+                const btnGapValueEl = dialog.querySelector("#nf-btn-gap-value");
+
+                const getCurrentColors = () => ({
+                    color1: color1Input.value,
+                    color2: color2Input.value,
+                    color3: color3Input.value,
+                    direction: colorDirectionInput.value
+                });
+
+                const getCurrentLabels = () => {
+                    const newCount = parseInt(countSelect.value, 10);
+                    const newLabels = {};
+                    const newWidths = {};
+                    for (let i = 0; i < newCount; i++) {
+                        const input = dialog.querySelector(`#nf-label-${i}`);
+                        if (input) {
+                            newLabels[String(i)] = input.value.trim();
+                        }
+                        const widthInput = dialog.querySelector(`#nf-label-width-${i}`);
+                        if (widthInput) {
+                            let w = parseInt(widthInput.value, 10);
+                            if (isNaN(w) || w < 55) w = 55;
+                            if (w > 300) w = 300;
+                            newWidths[String(i)] = w;
+                        }
+                    }
+                    return { newCount, newLabels, newWidths };
+                };
+
+                const originalSettings = JSON.parse(JSON.stringify(settings));
+
+                const applyCurrentSettings = () => {
+                    const { newCount, newLabels, newWidths } = getCurrentLabels();
+                    let newColumns = parseInt(columnsInput?.value, 10);
+                    if (isNaN(newColumns) || newColumns < 1) newColumns = 1;
+                    newColumns = Math.min(newColumns, newCount);
+                    const newColors = getCurrentColors();
+                    let newBtnHeight = parseInt(btnHeightInput?.value, 10);
+                    if (isNaN(newBtnHeight) || newBtnHeight < 30) newBtnHeight = 30;
+                    if (newBtnHeight > 80) newBtnHeight = 80;
+                    let newFontSize = parseInt(fontSizeInput?.value, 10);
+                    if (isNaN(newFontSize) || newFontSize < 10) newFontSize = 10;
+                    if (newFontSize > 24) newFontSize = 24;
+                    let newBtnGap = parseInt(btnGapInput?.value, 10);
+                    if (isNaN(newBtnGap) || newBtnGap < 0) newBtnGap = 0;
+                    if (newBtnGap > 20) newBtnGap = 20;
+                    const newFontColor = fontColorInput?.value || DEFAULT_FONT_COLOR;
+                    const newInactiveColor = inactiveColorInput?.value || "#2a2a2a";
+                    const newScaleMode = scaleModeInput?.value === "fixed" ? "fixed" : "auto";
+                    let newContentScale = parseFloat(contentScaleInput?.value);
+                    if (!Number.isFinite(newContentScale)) newContentScale = 1;
+                    newContentScale = Math.max(0.5, Math.min(3, newContentScale));
+                    setNodeSettings(node, {
+                        labels: newLabels,
+                        colors: newColors,
+                        count: newCount,
+                        columns: newColumns,
+                        btnWidth: DEFAULT_BTN_WIDTH,
+                        btnHeight: newBtnHeight,
+                        fontSize: newFontSize,
+                        btnGap: newBtnGap,
+                        fontColor: newFontColor,
+                        inactiveColor: newInactiveColor,
+                        scaleMode: newScaleMode,
+                        contentScale: newContentScale,
+                        widths: newWidths
+                    });
+                    rebuildSelectorNode(node);
+                };
+
+                // 轻量级即时更新：只更新widget值和触发重绘，不重建节点
+                const applyColorPreview = () => {
+                    const curColors = getCurrentColors();
+                    const curFontColor = fontColorInput?.value || DEFAULT_FONT_COLOR;
+                    const curInactiveColor = inactiveColorInput?.value || "#2a2a2a";
+                    const curSettings = getNodeSettings(node);
+                    curSettings.colors = curColors;
+                    curSettings.fontColor = curFontColor;
+                    curSettings.inactiveColor = curInactiveColor;
+                    setNodeSettings(node, curSettings);
+                    // 与 rui_selector.js 中鼠标点击刷新方式一致
+                    node.setDirtyCanvas(true, true);
+                };
+
+                color1Input.addEventListener("input", () => { applyColorPreview(); });
+                color2Input.addEventListener("input", () => { applyColorPreview(); });
+                color3Input.addEventListener("input", () => { applyColorPreview(); });
+                colorDirectionInput.addEventListener("change", () => { applyColorPreview(); });
+                fontColorInput?.addEventListener("input", () => { applyColorPreview(); });
+                inactiveColorInput?.addEventListener("input", () => { applyColorPreview(); });
+
+                const updateScaleState = () => {
+                    const fixed = scaleModeInput?.value === "fixed";
+                    if (contentScaleInput) contentScaleInput.disabled = !fixed;
+                    if (contentScaleRow) contentScaleRow.style.opacity = fixed ? "1" : "0.45";
+                };
+                scaleModeInput?.addEventListener("change", () => {
+                    updateScaleState();
+                    applyCurrentSettings();
+                });
+                contentScaleInput?.addEventListener("input", () => {
+                    const value = Math.max(0.5, Math.min(3, parseFloat(contentScaleInput.value) || 1));
+                    contentScaleInput.value = String(value);
+                    if (contentScaleValueEl) contentScaleValueEl.textContent = value.toFixed(2) + "x";
+                    applyCurrentSettings();
+                });
+                updateScaleState();
+
+                const updateColumnsState = () => {
+                    const curCount = parseInt(countSelect.value, 10);
+                    if (columnsInput) {
+                        columnsInput.max = String(curCount);
+                        let curColumns = parseInt(columnsInput.value, 10);
+                        if (isNaN(curColumns) || curColumns < 1) curColumns = 1;
+                        if (curColumns > curCount) curColumns = curCount;
+                        columnsInput.value = String(curColumns);
+                        if (columnsValueEl) columnsValueEl.textContent = String(curColumns);
+                    }
+                };
+
+                countSelect.addEventListener("input", () => {
+                    const newCount = parseInt(countSelect.value, 10);
+                    const body = dialog.querySelector(".nf-dialog-body");
+                    const scrollTop = body ? body.scrollTop : 0;
+                    const { newLabels: oldLabels, newWidths: oldWidths } = getCurrentLabels();
+                    labelsContainer.innerHTML = buildLabelsHTML(oldLabels, oldWidths, newCount, DEFAULT_BTN_WIDTH);
+                    if (body) body.scrollTop = scrollTop;
+                    if (countValueEl) countValueEl.textContent = String(newCount);
+                    updateColumnsState();
+                    applyCurrentSettings();
+                });
+
+                labelsContainer.addEventListener("input", (e) => {
+                    if (e.target && e.target.id) {
+                        if (e.target.id.startsWith("nf-label-width-")) {
+                            const idx = e.target.id.replace("nf-label-width-", "");
+                            const valEl = dialog.querySelector(`#nf-label-width-val-${idx}`);
+                            let v = parseInt(e.target.value, 10);
+                            if (isNaN(v) || v < 55) v = 55;
+                            if (v > 300) v = 300;
+                            e.target.value = String(v);
+                            if (valEl) valEl.textContent = String(v) + "px";
+                        }
+                        applyCurrentSettings();
+                    }
+                });
+
+                columnsInput?.addEventListener("input", () => {
+                    const curCount = parseInt(countSelect.value, 10);
+                    let v = parseInt(columnsInput.value, 10);
+                    if (isNaN(v) || v < 1) v = 1;
+                    if (v > curCount) v = curCount;
+                    columnsInput.value = String(v);
+                    if (columnsValueEl) columnsValueEl.textContent = String(v);
+                    applyCurrentSettings();
+                });
+
+                btnHeightInput?.addEventListener("input", () => {
+                    let v = parseInt(btnHeightInput.value, 10);
+                    if (isNaN(v) || v < 30) v = 30;
+                    if (v > 80) v = 80;
+                    btnHeightInput.value = String(v);
+                    if (btnHeightValueEl) btnHeightValueEl.textContent = String(v);
+                    applyCurrentSettings();
+                });
+
+                fontSizeInput?.addEventListener("input", () => {
+                    let v = parseInt(fontSizeInput.value, 10);
+                    if (isNaN(v) || v < 10) v = 10;
+                    if (v > 24) v = 24;
+                    fontSizeInput.value = String(v);
+                    if (fontSizeValueEl) fontSizeValueEl.textContent = String(v);
+                    applyCurrentSettings();
+                });
+
+                btnGapInput?.addEventListener("input", () => {
+                    let v = parseInt(btnGapInput.value, 10);
+                    if (isNaN(v) || v < 0) v = 0;
+                    if (v > 20) v = 20;
+                    btnGapInput.value = String(v);
+                    if (btnGapValueEl) btnGapValueEl.textContent = String(v);
+                    applyCurrentSettings();
+                });
+
+                color1Input.focus();
+
+                const submit = () => {
+                    applyCurrentSettings();
+                    if (onSaved) onSaved();
+                    dialog.remove();
+                };
+
+                dialog.querySelector("#nf-dlg-reset").addEventListener("click", () => {
+                    const body = dialog.querySelector(".nf-dialog-body");
+                    const scrollTop = body ? body.scrollTop : 0;
+                    const defaultCount = DEFAULT_COUNT;
+                    countSelect.value = defaultCount;
+                    labelsContainer.innerHTML = buildLabelsHTML({}, {}, defaultCount, DEFAULT_BTN_WIDTH);
+                    if (body) body.scrollTop = scrollTop;
+                    if (countValueEl) countValueEl.textContent = String(defaultCount) + "个";
+                    color1Input.value = DEFAULT_COLORS.color1;
+                    color2Input.value = DEFAULT_COLORS.color2;
+                    color3Input.value = DEFAULT_COLORS.color3;
+                    colorDirectionInput.value = DEFAULT_COLORS.direction;
+                    if (columnsInput) columnsInput.value = String(Math.min(DEFAULT_COLUMNS, defaultCount));
+                    if (btnHeightInput) btnHeightInput.value = String(DEFAULT_BTN_HEIGHT);
+                    if (btnHeightValueEl) btnHeightValueEl.textContent = String(DEFAULT_BTN_HEIGHT) + "px";
+                    if (fontSizeInput) fontSizeInput.value = String(DEFAULT_FONT_SIZE);
+                    if (fontSizeValueEl) fontSizeValueEl.textContent = String(DEFAULT_FONT_SIZE) + "px";
+                    if (btnGapInput) btnGapInput.value = String(DEFAULT_BTN_GAP);
+                    if (btnGapValueEl) btnGapValueEl.textContent = String(DEFAULT_BTN_GAP) + "px";
+                    if (scaleModeInput) scaleModeInput.value = "auto";
+                    if (contentScaleInput) contentScaleInput.value = "1";
+                    if (contentScaleValueEl) contentScaleValueEl.textContent = "1.00x";
+                    if (fontColorInput) fontColorInput.value = DEFAULT_FONT_COLOR;
+                    updateColumnsState();
+                    updateScaleState();
+                    applyColorPreview();
+                    applyCurrentSettings();
+                });
+                const dialogEl = dialog.querySelector(".nf-selector-settings-dialog");
+                let isDragging = false;
+                let dragOffsetX = 0;
+                let dragOffsetY = 0;
+
+                const savedPos = (() => {
+                    try {
+                        const stored = localStorage.getItem("rui_selector_dialog_pos");
+                        if (stored) return JSON.parse(stored);
+                    } catch (e) {}
+                    return null;
+                })();
+
+                if (savedPos && savedPos.left !== undefined && savedPos.top !== undefined) {
+                    dialogEl.style.left = savedPos.left + "px";
+                    dialogEl.style.top = savedPos.top + "px";
+                    dialogEl.style.right = "auto";
+                    dialogEl.style.transform = "none";
+                }
+
+                const dragHandle = dialog.querySelector(".nf-dialog-drag-handle");
+                if (dragHandle) {
+                    dragHandle.addEventListener("mousedown", (e) => {
+                        isDragging = true;
+                        const rect = dialogEl.getBoundingClientRect();
+                        dragOffsetX = e.clientX - rect.left;
+                        dragOffsetY = e.clientY - rect.top;
+                        dialogEl.style.right = "auto";
+                        dialogEl.style.transform = "none";
+                        e.preventDefault();
+                        e.stopPropagation();
+                    });
+                }
+
+                document.addEventListener("mousemove", (e) => {
+                    if (!isDragging) return;
+                    let left = e.clientX - dragOffsetX;
+                    let top = e.clientY - dragOffsetY;
+                    const rect = dialogEl.getBoundingClientRect();
+                    if (left + rect.width > window.innerWidth) {
+                        left = window.innerWidth - rect.width;
+                    }
+                    if (top + rect.height > window.innerHeight) {
+                        top = window.innerHeight - rect.height;
+                    }
+                    if (left < 0) left = 0;
+                    if (top < 0) top = 0;
+                    dialogEl.style.left = left + "px";
+                    dialogEl.style.top = top + "px";
+                });
+
+                document.addEventListener("mouseup", () => {
+                    if (isDragging) {
+                        isDragging = false;
+                        try {
+                            const rect = dialogEl.getBoundingClientRect();
+                            localStorage.setItem("rui_selector_dialog_pos", JSON.stringify({
+                                left: rect.left,
+                                top: rect.top
+                            }));
+                        } catch (e) {}
+                    }
+                });
+
+                dialog.querySelector("#nf-dlg-cancel").addEventListener("click", () => {
+                    setNodeSettings(node, originalSettings);
+                    if (originalSize) node.setSize(originalSize);
+                    node.setDirtyCanvas(true, true);
+                    dialog.remove();
+                });
+                dialog.querySelector("#nf-dlg-ok").addEventListener("click", submit);
+            }
+
+            function refreshSelectorNode(node) {
+                // Canvas 版：重新触发重绘即可
+                if (app?.canvas) app.canvas.setDirtyCanvas(true, true);
+            }
+
+            function rebuildSelectorNode(node) {
+                const settings = getNodeSettings(node);
+                const count = settings.count;
+                const perRow = settings.columns;
+                const gap = Math.max(0, Math.min(20, settings.btnGap || DEFAULT_BTN_GAP));
+                const btnHeight = Math.max(30, Math.min(80, settings.btnHeight || DEFAULT_BTN_HEIGHT));
+                const rows = Math.ceil(count / perRow);
+                const scale = settings.scaleMode === "fixed"
+                    ? Math.max(0.5, Math.min(3, Number(settings.contentScale) || 1))
+                    : 1;
+
+                const widths = [];
+                for (let i = 0; i < count; i++) {
+                    const key = String(i);
+                    if (settings.widths && settings.widths[key] !== undefined) {
+                        widths.push(Math.max(55, Math.min(300, settings.widths[key])));
+                    } else {
+                        widths.push(Math.max(55, Math.min(300, settings.btnWidth || DEFAULT_BTN_WIDTH)));
+                    }
+                }
+
+                let maxRowWidth = 0;
+                for (let r = 0; r < rows; r++) {
+                    const rowStart = r * perRow;
+                    const rowEnd = Math.min(rowStart + perRow, count);
+                    const rowCount = rowEnd - rowStart;
+                    let rowWidth = 0;
+                    for (let i = rowStart; i < rowEnd; i++) {
+                        rowWidth += widths[i];
+                    }
+                    rowWidth += (rowCount - 1) * gap;
+                    maxRowWidth = Math.max(maxRowWidth, rowWidth);
+                }
+                const contentW = maxRowWidth;
+
+                const contentH = rows * btnHeight + (rows - 1) * gap;
+                const newW = settings.scaleMode === "fixed" ? Math.max(120, contentW * scale + 12) : 120;
+                const newH = settings.scaleMode === "fixed" ? Math.max(80, contentH * scale + 60) : 80;
+                if (!node.size || node.size[0] < newW || node.size[1] < newH) {
+                    node.setSize([
+                        Math.max(node.size?.[0] || 0, newW),
+                        Math.max(node.size?.[1] || 0, newH),
+                    ]);
+                }
+                node.resizable = true;
+                node.flags = node.flags || {};
+                node.flags.resizable = true;
+                if (app?.canvas) {
+                    app.canvas.setDirty(true, true);
+                    app.graph?.setDirtyCanvas(true, true);
+                    app.graph?.change?.();
+                }
+            }
+
+            // 通过 getExtraMenuOptions 添加右键菜单（永远第一行）
+            const origGetExtra = nodeType.prototype.getExtraMenuOptions;
+            nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+                if (origGetExtra) origGetExtra.apply(this, arguments);
+                options.splice(0, 0, null, {
+                    content: `<span style="color:#FFD700;">${ruiT('Rui选择器设置','Rui Selector Settings')}</span>`,
+                    callback: () => {
+                        showLabelsSettingsDialog(this, () => { rebuildSelectorNode(this); });
+                    }
+                });
+            };
+
+            // 注：DOM widget 创建逻辑已移除，选择器 Canvas 绘制版在 rui_selector.js 中实现
+            // 此处保留设置对话框和右键菜单即可
+        }
+
+        if (nodeData.name === "RuiTitle") {
+            const DEFAULT_PROPS = {
+                text: "双击编辑",
+                fontSize: 50,
+                fontColor: "#ffffff",
+                bgColor: "#2a2a2a",
+                borderRadius: 3,
+                bgPadding: 4,
+                textAlign: "center",
+                letterSpacing: 0,
+                lineHeight: 1,
+                glowEnabled: false,
+                glowSize: 15,
+                glowColor: "#4CAF50",
+                glowIntensity: 1,
+                bgEnabled: false,
+                rainbowEnabled: false,
+                rainbowSpeed: 30,
+                rainbowStyle: "波浪",
+            };
+            const TITLE_CONFIG_KEY = "rui_last_title_config";
+
+            function saveLastTitleConfig(props) {
+                const config = { ...props };
+                delete config.text;
+                try {
+                    localStorage.setItem(TITLE_CONFIG_KEY, JSON.stringify(config));
+                } catch (e) {}
+            }
+
+            function loadLastTitleConfig(defaults) {
+                try {
+                    const stored = localStorage.getItem(TITLE_CONFIG_KEY);
+                    if (stored) {
+                        const config = JSON.parse(stored);
+                        if (config && typeof config === 'object') {
+                            return { ...defaults, ...config, text: defaults.text };
+                        }
+                    }
+                } catch (e) {}
+                return { ...defaults };
+            }
+
+            const DOM_PREFIX = "xz-title";
+
+            function hexToRgb(hex) {
+                const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+                return result ? {
+                    r: parseInt(result[1], 16),
+                    g: parseInt(result[2], 16),
+                    b: parseInt(result[3], 16)
+                } : { r: 255, g: 255, b: 255 };
+            }
+
+            function hslToRgb(h, s, l) {
+                h /= 360;
+                s /= 100;
+                l /= 100;
+                let r, g, b;
+                if (s === 0) {
+                    r = g = b = l;
+                } else {
+                    const hue2rgb = (p, q, t) => {
+                        if (t < 0) t += 1;
+                        if (t > 1) t -= 1;
+                        if (t < 1/6) return p + (q - p) * 6 * t;
+                        if (t < 1/2) return q;
+                        if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+                        return p;
+                    };
+                    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+                    const p = 2 * l - q;
+                    r = hue2rgb(p, q, h + 1/3);
+                    g = hue2rgb(p, q, h);
+                    b = hue2rgb(p, q, h - 1/3);
+                }
+                return {
+                    r: Math.round(r * 255),
+                    g: Math.round(g * 255),
+                    b: Math.round(b * 255)
+                };
+            }
+
+            function getRainbowColor(speed, offset = 0) {
+                const time = Date.now() * 0.002 * speed + offset;
+                const hue = (time % 360);
+                return hslToRgb(hue, 100, 60);
+            }
+
+            nodeType.title_mode = LiteGraph.NO_TITLE;
+            nodeType.collapsable = false;
+            nodeType.resizable = true;
+
+            function vueSels(id) {
+                return [`[data-node-id="${id}"]`, `[data-id="${id}"]`, `#node-${id}`, `.litegraph-node[data-node-id="${id}"]`, `.comfy-node[data-node-id="${id}"]`, `.litegraph-node[data-id="${id}"]`, `.comfy-node[data-id="${id}"]`];
+            }
+
+            function hideNodeLabels(node) {
+                for (const sel of vueSels(node.id)) {
+                    const dom = document.querySelector(sel);
+                    if (!dom) continue;
+                    const hideTextNodes = (el) => {
+                        el.childNodes.forEach(child => {
+                            if (child.nodeType === Node.TEXT_NODE) {
+                                const text = child.textContent.trim();
+                                if (text === "rui" || text === "Rui" || text === "Rui") {
+                                    child.textContent = "";
+                                }
+                            } else if (child.nodeType === Node.ELEMENT_NODE) {
+                                const text = child.textContent.trim();
+                                if (text === "rui" || text === "Rui" || text === "Rui") {
+                                    child.style.display = "none";
+                                    child.style.opacity = "0";
+                                    child.style.height = "0";
+                                    child.style.width = "0";
+                                    child.style.overflow = "hidden";
+                                } else {
+                                    hideTextNodes(child);
+                                }
+                            }
+                        });
+                    };
+                    hideTextNodes(dom);
+                }
+            }
+
+            function applyNodeStyle(node) {
+                if (!node?.properties) return;
+                const tid = `${DOM_PREFIX}-bg-${node.id}`;
+                node.bgcolor = "transparent";
+                node.color = "#fff0";
+                let el = document.getElementById(tid);
+                if (!el) {
+                    el = document.createElement("style");
+                    el.id = tid;
+                    document.head.appendChild(el);
+                }
+                const sels = vueSels(node.id).join(",");
+                el.textContent =
+                    `${sels}{background:transparent!important;background-color:transparent!important;border:none!important;box-shadow:none!important;border-radius:0!important;overflow:visible!important;}` +
+                    `${sels} *{background:transparent!important;background-color:transparent!important;border:none!important;box-shadow:none!important;}` +
+                    `${sels} .node-body,${sels} .litegraph-node-body,${sels} [class*='node-body'],${sels} [class*='node_body'],${sels} .litegraph-node,${sels} .node-container{background:transparent!important;background-color:transparent!important;border:none!important;box-shadow:none!important;overflow:visible!important;}` +
+                    `${sels} .node-title,${sels} .litegraph-node-title,${sels} .comfy-node-title,${sels} [class*='title'],${sels} .node-header,${sels} .litegraph-node-header,${sels} .comfy-node-header,${sels} [class*='header'],${sels} .node-type,${sels} .comfy-node-type,${sels} [class*='type'],${sels} .node-badge,${sels} .comfy-badge,${sels} [class*='badge'],${sels} .comfy-menu-button,${sels} .comfy-node-menu,${sels} .litegraph-node-type,${sels} .node-category,${sels} [class*='category'],${sels} .node-label,${sels} [class*='label']{display:none!important;opacity:0!important;height:0!important;width:0!important;overflow:hidden!important;margin:0!important;padding:0!important;}`;
+                for (const sel of vueSels(node.id)) {
+                    const dom = document.querySelector(sel);
+                    if (!dom) continue;
+                    dom.style.setProperty("background", "transparent", "important");
+                    dom.style.setProperty("background-color", "transparent", "important");
+                    dom.style.setProperty("border", "none", "important");
+                    dom.style.setProperty("box-shadow", "none", "important");
+                    dom.style.setProperty("border-radius", "0", "important");
+                    dom.style.setProperty("overflow", "visible", "important");
+                    dom.querySelectorAll(".node-body,.litegraph-node-body,[class*='node-body'],[class*='node_body'],.litegraph-node,.node-container").forEach(c => {
+                        c.style.setProperty("background", "transparent", "important");
+                        c.style.setProperty("background-color", "transparent", "important");
+                        c.style.setProperty("border", "none", "important");
+                        c.style.setProperty("box-shadow", "none", "important");
+                        c.style.setProperty("overflow", "visible", "important");
+                    });
+                    dom.querySelectorAll(".node-title,.litegraph-node-title,.comfy-node-title,[class*='title'],.node-header,.litegraph-node-header,.comfy-node-header,[class*='header'],.node-type,.comfy-node-type,.litegraph-node-type,[class*='type'],.node-badge,.comfy-badge,[class*='badge'],.comfy-menu-button,.comfy-node-menu,.node-category,[class*='category'],.node-label,[class*='label']").forEach(c => {
+                        c.style.display = "none";
+                        c.style.opacity = "0";
+                        c.style.height = "0";
+                        c.style.width = "0";
+                        c.style.overflow = "hidden";
+                    });
+                }
+                hideNodeLabels(node);
+            }
+
+            const _origCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                _origCreated?.apply(this, arguments);
+                this.flags = this.flags || {};
+                this.resizable = true;
+                this.flags.resizable = true;
+                this.size = [200, 120];
+                this.properties = loadLastTitleConfig(DEFAULT_PROPS);
+                this.color = "#fff0";
+                this.bgcolor = "transparent";
+                this.isEditing = false;
+                this.editTextarea = null;
+                this._removed = false;
+                this._ruiTitleConfigured = false;
+                this._ruiTitleFixedFrame = false;
+                const cs = measureTitleSize(this);
+                this.size[0] = cs[0];
+                this.size[1] = cs[1];
+                let tries = 0;
+                const _tick = () => {
+                    if (this._removed) return;
+                    applyNodeStyle(this, false);
+                    attachVueDblClick(this);
+                    // 不清理title/label，保留名称供管理面板识别
+                    if (++tries >= 20) return;
+                    setTimeout(_tick, 100);
+                };
+                setTimeout(_tick, 100);
+            };
+
+            const _origConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                this._ruiTitleConfiguring = true;
+                try {
+                    _origConfigure?.apply(this, arguments);
+                } finally {
+                    this._ruiTitleConfiguring = false;
+                }
+                this.properties = this.properties || { ...DEFAULT_PROPS };
+                if (info.properties) Object.assign(this.properties, info.properties);
+                this._ruiTitleConfigured = true;
+                this._ruiTitleFixedFrame = true;
+                // pos / size / flags 已由 LiteGraph 原生 configure 处理，这里不再重复赋值
+                // 已加载节点以工作流保存的边框尺寸为准，文字仅在框内适配。
+                this.color = "#fff0";
+                this.bgcolor = "transparent";
+                let tries = 0;
+                const _cfgTick = () => {
+                    if (this._removed) return;
+                    applyNodeStyle(this, false);
+                    attachVueDblClick(this);
+                    if (++tries >= 15) return;
+                    setTimeout(_cfgTick, 100);
+                };
+                setTimeout(_cfgTick, 100);
+            };
+
+            const _origSerialize = nodeType.prototype.serialize;
+            nodeType.prototype.serialize = function () {
+                const d = _origSerialize ? _origSerialize.apply(this, arguments) : {};
+                if (!d.id && this.id) d.id = this.id;
+                d.properties = { ...this.properties };
+                if (!d.pos && this.pos) d.pos = [...this.pos];
+                if (!d.size && this.size) d.size = [...this.size];
+                if (!d.flags && this.flags) d.flags = { ...this.flags };
+                return d;
+            };
+
+            nodeType.prototype.onAdded = function () {
+                this.properties = this.properties || { ...DEFAULT_PROPS };
+                this.color = "#fff0";
+                this.bgcolor = "transparent";
+                let tries = 0;
+                const _addedTick = () => {
+                    if (this._removed) return;
+                    applyNodeStyle(this, false);
+                    attachVueDblClick(this);
+                    if (++tries >= 15) {
+                        setTimeout(() => {
+                            if (this._ruiTitleConfigured) ensureTitleFrameContainsText(this, this.size);
+                        }, 100);
+                        return;
+                    }
+                    setTimeout(_addedTick, 100);
+                };
+                setTimeout(_addedTick, 100);
+            };
+
+            nodeType.prototype.onRemoved = function () {
+                this._removed = true;
+                if (this._titleAnimFrame != null) {
+                    cancelAnimationFrame(this._titleAnimFrame);
+                    this._titleAnimFrame = null;
+                }
+                if (this.editTextarea) {
+                    this.editTextarea.remove();
+                    this.editTextarea = null;
+                }
+                clearTimeout(this._ruiTitleSaveTimer);
+                detachVueDblClick(this);
+                const el = document.getElementById(`${DOM_PREFIX}-bg-${this.id}`);
+                if (el) el.remove();
+            };
+
+            const TITLE_FONT_FAMILY = `"Microsoft YaHei", "微软雅黑", "PingFang SC", "Hiragino Sans GB", "SimHei", Arial, sans-serif`;
+
+            function getTitleMeasureContext() {
+                const cv = (window.app?.canvas || LGraphCanvas.active_canvas)?.canvas;
+                return cv?.getContext("2d") || document.createElement("canvas").getContext("2d");
+            }
+
+            function setTitleMeasureFont(ctx, fontSize, letterSpacing) {
+                ctx.font = `normal ${fontSize}px ${TITLE_FONT_FAMILY}`;
+                ctx.letterSpacing = `${letterSpacing || 0}px`;
+            }
+
+            function measureTitleLine(ctx, line, letterSpacing) {
+                if (!line) return 0;
+                const width = ctx.measureText(line).width;
+                const trailing = Math.abs(letterSpacing || 0);
+                return Math.max(0, width - trailing);
+            }
+
+            function wrapTitleText(ctx, text, maxWidth, letterSpacing) {
+                const paragraphs = String(text ?? "").split("\n");
+                if (!Number.isFinite(maxWidth)) return paragraphs;
+                const lines = [];
+                const width = Math.max(1, maxWidth);
+
+                paragraphs.forEach(paragraph => {
+                    if (!paragraph) {
+                        lines.push("");
+                        return;
+                    }
+                    let line = "";
+                    for (const char of Array.from(paragraph)) {
+                        const next = line + char;
+                        if (line && measureTitleLine(ctx, next, letterSpacing) > width) {
+                            lines.push(line);
+                            line = char;
+                        } else {
+                            line = next;
+                        }
+                    }
+                    lines.push(line);
+                });
+                return lines.length ? lines : [""];
+            }
+
+            function layoutTitleText(node, fontSize, frameWidth = Infinity) {
+                const p = node.properties || DEFAULT_PROPS;
+                const verticalPadding = p.bgPadding ?? 4;
+                const letterSpacing = p.letterSpacing || 0;
+                const contentWidth = Number.isFinite(frameWidth) ? Math.max(1, frameWidth) : Infinity;
+                const ctx = getTitleMeasureContext();
+                ctx.save();
+                setTitleMeasureFont(ctx, fontSize, letterSpacing);
+                const lines = wrapTitleText(ctx, p.text || "", contentWidth, letterSpacing);
+                const widths = lines.map(line => measureTitleLine(ctx, line, letterSpacing));
+                const maxLineWidth = widths.reduce((max, width) => Math.max(max, width), 0);
+                const firstMetric = ctx.measureText(lines[0] || "M");
+                const lastMetric = ctx.measureText(lines[lines.length - 1] || "M");
+                const firstAscent = firstMetric.actualBoundingBoxAscent || fontSize * 0.8;
+                const lastDescent = lastMetric.actualBoundingBoxDescent || fontSize * 0.2;
+                ctx.restore();
+
+                const lineHeight = fontSize * (p.lineHeight || 1);
+                const blockHeight = lines.length > 1
+                    ? firstAscent + (lines.length - 1) * lineHeight + lastDescent
+                    : firstAscent + lastDescent;
+                return {
+                    lines,
+                    widths,
+                    lineHeight,
+                    firstAscent,
+                    lastDescent,
+                    maxLineWidth,
+                    requiredHeight: blockHeight + verticalPadding * 2,
+                    requiredWidth: maxLineWidth,
+                };
+            }
+
+            function measureTitleSize(node) {
+                const p = node.properties || DEFAULT_PROPS;
+                const layout = layoutTitleText(node, p.fontSize || 16);
+                return [Math.max(50, layout.requiredWidth), Math.max(18, layout.requiredHeight)];
+            }
+
+            nodeType.prototype.computeSize = function () {
+                return [50, 18];
+            };
+
+            const _origTitleResize = nodeType.prototype.onResize;
+
+            function ensureTitleFrameContainsText(node, size) {
+                if (node._ruiTitleFitting || node._ruiTitleConfiguring || !node.properties || !size) return;
+                const p = node.properties;
+                const fontSize = Math.max(8, Math.min(300, Number(p.fontSize) || 16));
+                let frameWidth = Math.max(50, Number(size[0]) || 50);
+                const frameHeight = Math.max(18, Number(size[1]) || 18);
+                let layout = layoutTitleText(node, fontSize, frameWidth);
+
+                const minimumWidth = Math.ceil(layout.maxLineWidth);
+                if (minimumWidth > frameWidth) {
+                    frameWidth = minimumWidth;
+                    layout = layoutTitleText(node, fontSize, frameWidth);
+                }
+
+                node._ruiTitleFitting = true;
+                const requiredHeight = Math.max(frameHeight, Math.ceil(layout.requiredHeight));
+                const changed = node.size[0] !== frameWidth || node.size[1] !== requiredHeight;
+                node.size[0] = frameWidth;
+                node.size[1] = requiredHeight;
+                node._ruiTitleFitting = false;
+
+                if (changed) node.graph?.change?.();
+                node.setDirtyCanvas?.(true, true);
+            }
+
+            nodeType.prototype.onResize = function (size) {
+                const result = _origTitleResize?.apply(this, arguments);
+                if (!this._ruiTitleConfiguring && !this._ruiTitleFitting && !this.isEditing) {
+                    this._ruiTitleFixedFrame = true;
+                    ensureTitleFrameContainsText(this, size || this.size);
+                }
+                return result;
+            };
+
+            nodeType.prototype.adjustHeightToContent = function () {
+                if (this._ruiTitleFixedFrame || this._ruiTitleConfigured) {
+                    ensureTitleFrameContainsText(this, this.size);
+                    return;
+                }
+                const autoSize = measureTitleSize(this);
+                const changed = this.size[0] !== autoSize[0] || this.size[1] !== autoSize[1];
+                this.size[0] = autoSize[0];
+                this.size[1] = autoSize[1];
+                if (changed) this.graph?.change?.();
+            };
+
+            nodeType.prototype.onDrawBackground = function (ctx) {
+                const p = this.properties || DEFAULT_PROPS;
+                const w = this.size[0] || 100;
+                const h = this.size[1] || 60;
+                const fontSize = p.fontSize || 16;
+                const fontColor = p.fontColor || "#ffffff";
+                const glowEnabled = p.glowEnabled;
+                const glowSize = p.glowSize || 15;
+                const glowColor = p.glowColor || "#FFD700";
+                const glowIntensity = p.glowIntensity || 1;
+                const rainbowEnabled = p.rainbowEnabled;
+                const rainbowSpeed = p.rainbowSpeed ?? 30;
+                const layout = layoutTitleText(this, fontSize, w);
+                const lines = layout.lines;
+                const lineHeight = layout.lineHeight;
+                const isBypassed = this.mode === 4; // LiteGraph.BYPASS
+                ctx.save();
+
+                if (p.bgEnabled && p.bgColor && p.bgColor !== "transparent") {
+                    ctx.fillStyle = p.bgColor;
+                    const br = p.borderRadius ?? 8;
+                    ctx.save();
+                    ctx.globalAlpha = p.bgOpacity ?? 1;
+                    ctx.beginPath();
+                    ctx.roundRect(0, 0, w, h, br);
+                    ctx.fill();
+                    ctx.restore();
+                }
+
+                if (this.selected) {
+                    ctx.fillStyle = "rgba(76, 175, 80, 0.06)";
+                    ctx.fillRect(0, 0, w, h);
+                    ctx.strokeStyle = "#4CAF50";
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([4, 4]);
+                    ctx.strokeRect(1, 1, w - 2, h - 2);
+                    ctx.setLineDash([]);
+                }
+
+                const verticalPadding = p.bgPadding ?? 4;
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(0, verticalPadding, w, Math.max(0, h - verticalPadding * 2));
+                ctx.clip();
+
+                ctx.font = `normal ${fontSize}px ${TITLE_FONT_FAMILY}`;
+                ctx.letterSpacing = `${p.letterSpacing || 0}px`;
+                ctx.textBaseline = "alphabetic";
+                const align = p.textAlign || "center";
+                ctx.textAlign = align;
+                const xPos = align === "left" ? 0 :
+                    (align === "right" ? w : w / 2);
+                const startY = verticalPadding + layout.firstAscent;
+
+                if (rainbowEnabled && this._titleAnimFrame == null) {
+                    this._titleAnimFrame = requestAnimationFrame(() => {
+                        this._titleAnimFrame = null;
+                        if (this.graph && !this.isEditing) this.setDirtyCanvas?.(true, true);
+                    });
+                } else if (!rainbowEnabled && this._titleAnimFrame != null) {
+                    cancelAnimationFrame(this._titleAnimFrame);
+                    this._titleAnimFrame = null;
+                }
+
+                const getLineFillStyle = (lineWidth, lineIndex, lineStartX) => {
+                    if (!rainbowEnabled) return fontColor;
+                    const style = p.rainbowStyle || "波浪";
+                    const time = Date.now() * 0.002 * (rainbowSpeed / 30);
+                    if (style === "整体透明") {
+                        const alpha = ((Math.sin(time) + 1) / 2);
+                        const rgb = hexToRgb(fontColor);
+                        return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha.toFixed(2)})`;
+                    }
+                    if (style === "呼吸") {
+                        const hue = ((Math.sin(time) + 1) / 2 * 360) % 360;
+                        const rgb = hslToRgb(hue, 100, 60);
+                        return `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
+                    }
+                    const grad = ctx.createLinearGradient(lineStartX, 0, lineStartX + lineWidth, 0);
+                    if (style === "透明渐变") {
+                        const rgb = hexToRgb(fontColor);
+                        for (let s = 0; s <= 1; s += 0.02) {
+                            const alpha = ((Math.sin(time + lineIndex * 0.5 + s * 3) + 1) / 2);
+                            grad.addColorStop(s, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha.toFixed(2)})`);
+                        }
+                    } else {
+                        for (let s = 0; s <= 1; s += 0.02) {
+                            const hue = (time * 60 + lineIndex * 30 + s * 360) % 360;
+                            const rgb = hslToRgb(hue, 100, 60);
+                            grad.addColorStop(s, `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`);
+                        }
+                    }
+                    return grad;
+                };
+
+                lines.forEach((line, i) => {
+                    const y = startY + i * lineHeight;
+                    if (y + layout.lastDescent > h - verticalPadding + 0.5) return;
+                    const textWidth = layout.widths[i] || 0;
+                    const lineStartX = align === "center" ? xPos - textWidth / 2 : (align === "right" ? xPos - textWidth : xPos);
+
+                    // 编辑模式下始终渲染整行文字
+                    const renderSegments = [{ text: line, offset: 0 }];
+
+                    renderSegments.forEach(({ text, offset }) => {
+                        if (!text) return;
+                        const segX = lineStartX + ctx.measureText(line.substring(0, offset)).width;
+                        const savedAlign = ctx.textAlign;
+                        ctx.textAlign = "left";
+
+                        if (!rainbowEnabled && !glowEnabled) {
+                            ctx.fillStyle = fontColor;
+                            ctx.fillText(text, segX, y);
+                        } else if (!rainbowEnabled && glowEnabled) {
+                            const g = glowColor;
+                            ctx.save();
+                            ctx.shadowColor = g;
+                            ctx.shadowBlur = glowSize * glowIntensity * 2;
+                            ctx.globalAlpha = 0.15 * glowIntensity;
+                            ctx.fillStyle = fontColor;
+                            ctx.fillText(text, segX, y);
+                            ctx.restore();
+                            ctx.save();
+                            ctx.shadowColor = g;
+                            ctx.shadowBlur = glowSize * glowIntensity;
+                            ctx.globalAlpha = 0.3 * glowIntensity;
+                            ctx.fillStyle = fontColor;
+                            ctx.fillText(text, segX, y);
+                            ctx.restore();
+                            ctx.save();
+                            ctx.shadowColor = g;
+                            ctx.shadowBlur = glowSize * glowIntensity * 0.5;
+                            ctx.globalAlpha = 0.6 * glowIntensity;
+                            ctx.fillStyle = fontColor;
+                            ctx.fillText(text, segX, y);
+                            ctx.restore();
+                            ctx.fillStyle = fontColor;
+                            ctx.fillText(text, segX, y);
+                        } else {
+                            const fillStyle = getLineFillStyle(textWidth, i, lineStartX);
+                            const glowHue = (Date.now() * 0.002 * (rainbowSpeed / 30) * 60 + i * 30) % 360;
+                            const glowRgb = hslToRgb(glowHue, 100, 60);
+                            const glowCol = `rgb(${glowRgb.r}, ${glowRgb.g}, ${glowRgb.b})`;
+                            const g = glowEnabled ? glowCol : null;
+
+                            if (glowEnabled) {
+                                ctx.save();
+                                ctx.shadowColor = g;
+                                ctx.shadowBlur = glowSize * glowIntensity * 2;
+                                ctx.globalAlpha = 0.15 * glowIntensity;
+                                ctx.fillStyle = fillStyle;
+                                ctx.fillText(text, segX, y);
+                                ctx.restore();
+                                ctx.save();
+                                ctx.shadowColor = g;
+                                ctx.shadowBlur = glowSize * glowIntensity;
+                                ctx.globalAlpha = 0.3 * glowIntensity;
+                                ctx.fillStyle = fillStyle;
+                                ctx.fillText(text, segX, y);
+                                ctx.restore();
+                                ctx.save();
+                                ctx.shadowColor = g;
+                                ctx.shadowBlur = glowSize * glowIntensity * 0.5;
+                                ctx.globalAlpha = 0.6 * glowIntensity;
+                                ctx.fillStyle = fillStyle;
+                                ctx.fillText(text, segX, y);
+                                ctx.restore();
+                            }
+                            ctx.fillStyle = fillStyle;
+                            ctx.fillText(text, segX, y);
+                        }
+
+                        ctx.textAlign = savedAlign;
+                    });
+                });
+                ctx.restore();
+
+                // 绕过状态：紫色半透明覆盖层
+                if (isBypassed) {
+                    ctx.fillStyle = "rgba(106, 36, 106, 0.5)";
+                    ctx.fillRect(0, 0, w, h);
+                }
+
+                if (this.selected && !this.isEditing) {
+                    ctx.save();
+                    ctx.strokeStyle = "#4CAF50";
+                    ctx.lineWidth = 1.5;
+                    ctx.lineCap = "round";
+                    ctx.beginPath();
+                    ctx.moveTo(w - 12, h - 2);
+                    ctx.lineTo(w - 2, h - 12);
+                    ctx.moveTo(w - 8, h - 2);
+                    ctx.lineTo(w - 2, h - 8);
+                    ctx.moveTo(w - 4, h - 2);
+                    ctx.lineTo(w - 2, h - 4);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+
+                ctx.restore();
+            };
+
+            // 右键菜单：Rui主题永远第13行（下标12）
+            const origTitleExtra = nodeType.prototype.getExtraMenuOptions;
+            nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+                if (origTitleExtra) origTitleExtra.apply(this, arguments);
+                options.splice(12, 0, null, {
+                    content: `<span style="color:#FFD700;">${ruiT('Rui主题','Rui Theme')}</span>`,
+                    callback: () => {
+                        if (this.onDblClick) this.onDblClick();
+                    }
+                });
+            };
+
+            nodeType.prototype.onDblClick = function () {
+                if (this.isEditing) return true;
+                createTitleEditor(this);
+                return true;
+            };
+
+            nodeType.prototype.onMouseDown = function (e, pos) {
+                if (this.isEditing) return true;
+                const w = this.size[0] || 100;
+                const h = this.size[1] || 60;
+                if (pos[0] > w - 16 && pos[1] > h - 16) {
+                    return false;
+                }
+                const now = Date.now();
+                if (this._lastClickTime && now - this._lastClickTime < 300) {
+                    createTitleEditor(this);
+                    return true;
+                }
+                this._lastClickTime = now;
+                return false;
+            };
+
+            function getNodeViewportRect(node) {
+                const cv = window.app?.canvas || LGraphCanvas.active_canvas;
+                if (!cv?.canvas || !cv?.ds) return null;
+                const rect = cv.canvas.getBoundingClientRect();
+                const sc = cv.ds.scale;
+                const canvasPos = cv.convertOffsetToCanvas?.([node.pos[0], node.pos[1]]);
+                if (canvasPos) {
+                    return {
+                        left: rect.left + canvasPos[0],
+                        top: rect.top + canvasPos[1],
+                        scale: sc,
+                    };
+                }
+                return {
+                    left: rect.left + (node.pos[0] + cv.ds.offset[0]) * sc,
+                    top: rect.top + (node.pos[1] + cv.ds.offset[1]) * sc,
+                    scale: sc,
+                };
+            }
+
+            function attachVueDblClick(node) {
+                if (node._vueDblClickBound) return;
+                const handler = (e) => {
+                    if (node._removed) return;
+                    node._dblClickHandled = true;
+                    setTimeout(() => { node._dblClickHandled = false; }, 50);
+                    e.stopPropagation();
+                    e.preventDefault();
+                    if (!node.isEditing) createTitleEditor(node);
+                };
+                const tryBind = () => {
+                    if (node._removed) return true;
+                    for (const sel of vueSels(node.id)) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            el.addEventListener("dblclick", handler, true);
+                            node._vueDblClickBound = { el, handler };
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!tryBind()) {
+                    let tries = 0;
+                    node._dblClickBindTimer = setInterval(() => {
+                        if (tryBind() || ++tries > 20) {
+                            clearInterval(node._dblClickBindTimer);
+                            node._dblClickBindTimer = null;
+                        }
+                    }, 100);
+                }
+            }
+
+            function detachVueDblClick(node) {
+                if (node._dblClickBindTimer) {
+                    clearInterval(node._dblClickBindTimer);
+                    node._dblClickBindTimer = null;
+                }
+                if (!node._vueDblClickBound) return;
+                node._vueDblClickBound.el.removeEventListener("dblclick", node._vueDblClickBound.handler, true);
+                node._vueDblClickBound = null;
+            }
+
+            function createTitleEditor(node) {
+                if (node.editTextarea) removeTitleEditor(node);
+                const p = node.properties;
+                const vr = getNodeViewportRect(node);
+                if (!vr) return;
+                const sc = vr.scale;
+                
+                const container = document.createElement("div");
+                container.style.cssText = `position:fixed;left:${vr.left}px;top:${vr.top}px;width:${Math.max(50, node.size[0] * sc)}px;z-index:100000;`;
+                container.dataset.xzTitleEdit = node.id;
+
+                // textarea 文字默认透明，选中时可见
+                if (!document.getElementById("rui-title-edit-selection-style")) {
+                    const style = document.createElement("style");
+                    style.id = "rui-title-edit-selection-style";
+                    style.textContent = `[data-xz-title-edit] textarea::selection,[data-xz-title-edit] textarea::-moz-selection{color:#fff!important;background:#4CAF50!important;}`;
+                    document.head.appendChild(style);
+                }
+                
+                // 整个编辑面板拦截浏览器右键菜单
+                container.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); }, false);
+                
+                container.addEventListener("wheel", (e) => {
+                    if (e.target === ta) return; // let textarea handle its own wheel
+                    const cv = app.canvas?.canvas;
+                    if (!cv) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    cv.dispatchEvent(new WheelEvent('wheel', {
+                        deltaY: e.deltaY, deltaX: e.deltaX,
+                        clientX: e.clientX, clientY: e.clientY,
+                        ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+                        bubbles: true, cancelable: true
+                    }));
+                }, { capture: true, passive: false });
+                
+                const ta = document.createElement("textarea");
+                ta.value = p.text;
+                ta.spellcheck = false;
+                const editScale = sc;
+                const editFontSize = p.fontSize * sc;
+                const editHeight = Math.max(18, node.size[1] * sc);
+                // canvas 文字基线位置: startY = fontSize * 0.75
+                // textarea 文字基线位置: padding-top + halfLeading + ascent
+                // halfLeading = (lineHeight - fontSize) / 2 = fontSize * (lineHeight - 1) / 2
+                // 对于 line-height: 1.4: halfLeading = fontSize * 0.2
+                // ascent ≈ fontSize * 0.8
+                // 所以 textarea 基线 = padding-top + fontSize * 0.2 + fontSize * 0.8 = padding-top + fontSize
+                // canvas 基线（屏幕空间）= p.fontSize * 0.75 * sc
+                // 对齐: padding-top + p.fontSize * sc = p.fontSize * 0.75 * sc
+                // => padding-top = -0.25 * p.fontSize * sc （负值，不设padding，让文字在顶部）
+                // 此时 textarea 文字顶部 = 0 + halfLeading = 0.2 * p.fontSize * sc
+                // canvas 文字顶部 = (0.75 - 0.8) * p.fontSize * sc = -0.05 * p.fontSize * sc
+                // 差异仅 0.25 * fontSize * sc，约 12.5px（fontSize=50时），远小于旧公式的 43.5px
+                // 加上垂直边距，使选中高亮与渲染文字垂直位置一致
+                // 补偿 CSS line-height 半行距（halfLeading = fontSize * (lineHeight - 1) / 2）
+                const calcTitlePad = (props, s, lh) => {
+                    const bp = (props.bgPadding ?? 4) * s;
+                    const lineH = lh ?? props.lineHeight ?? 1;
+                    const hl = (props.fontSize || 16) * s * (lineH - 1) / 2;
+                    return Math.max(0, bp - hl);
+                };
+                const editPaddingTop = calcTitlePad(p, sc);
+                ta.style.cssText = `width:100%;height:${editHeight}px;outline:none;border:none;resize:none;padding:${editPaddingTop}px 0;box-sizing:border-box;text-align:${p.textAlign || "center"};background:transparent;color:transparent;caret-color:#00ff6a;-webkit-text-fill-color:transparent;font: normal ${editFontSize}px ${TITLE_FONT_FAMILY};line-height:${p.lineHeight || 1};letter-spacing:${(p.letterSpacing || 0) * editScale}px;border-radius:${(p.borderRadius ?? 8) * editScale}px;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;position:relative;`;
+                
+                const toolbar = document.createElement("div");
+                toolbar.style.cssText = `position:absolute;left:0;right:0;bottom:100%;display:flex;align-items:stretch;margin-bottom:6px;`;
+                
+                const leftPanel = document.createElement("div");
+                leftPanel.style.cssText = `display:flex;flex-direction:column;background:rgba(42,42,42,0.95);border:1px solid #444;border-right:none;border-radius:6px 0 0 6px;padding:4px 0;`;
+                
+                const rowSeparator = () => {
+                    const sep = document.createElement("div");
+                    sep.style.cssText = `height:1px;background:#444;margin:4px 6px;`;
+                    return sep;
+                };
+                
+                const row1 = document.createElement("div");
+                row1.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;`;
+                
+                const sliderLabel = document.createElement("span");
+                sliderLabel.textContent = "字号";
+                sliderLabel.style.cssText = `color:#aaa;font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;`;
+                
+                const slider = document.createElement("input");
+                slider.type = "range";
+                slider.min = "8";
+                slider.max = "300";
+                slider.step = "1";
+                slider.value = p.fontSize;
+                slider.style.cssText = `flex:1;height:4px;cursor:pointer;`;
+                
+                const sliderValue = document.createElement("span");
+                sliderValue.textContent = p.fontSize + "px";
+                sliderValue.style.cssText = `color:#4CAF50;font-size:13px;white-space:nowrap;min-width:36px;text-align:right;font-family:Arial,sans-serif;`;
+                
+                row1.appendChild(sliderLabel);
+                row1.appendChild(slider);
+                row1.appendChild(sliderValue);
+                
+                const rowLetterSpacing = document.createElement("div");
+                rowLetterSpacing.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;`;
+                
+                const letterSpacingLabel = document.createElement("span");
+                letterSpacingLabel.textContent = "字距";
+                letterSpacingLabel.style.cssText = `color:#aaa;font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;`;
+                
+                const letterSpacingSlider = document.createElement("input");
+                letterSpacingSlider.type = "range";
+                letterSpacingSlider.min = "0";
+                letterSpacingSlider.max = "50";
+                letterSpacingSlider.step = "0.5";
+                letterSpacingSlider.value = p.letterSpacing || 0;
+                letterSpacingSlider.style.cssText = `flex:1;height:4px;cursor:pointer;`;
+                
+                const letterSpacingValue = document.createElement("span");
+                letterSpacingValue.textContent = (p.letterSpacing || 0).toFixed(1) + "px";
+                letterSpacingValue.style.cssText = `color:#4CAF50;font-size:13px;white-space:nowrap;min-width:40px;text-align:right;font-family:Arial,sans-serif;`;
+
+                rowLetterSpacing.appendChild(letterSpacingLabel);
+                rowLetterSpacing.appendChild(letterSpacingSlider);
+                rowLetterSpacing.appendChild(letterSpacingValue);
+
+                const row2 = document.createElement("div");
+                row2.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;`;
+                
+                const lineHeightLabel = document.createElement("span");
+                lineHeightLabel.textContent = "行距";
+                lineHeightLabel.style.cssText = `color:#aaa;font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;`;
+                
+                const lineHeightSlider = document.createElement("input");
+                lineHeightSlider.type = "range";
+                lineHeightSlider.min = "1";
+                lineHeightSlider.max = "10";
+                lineHeightSlider.step = "0.1";
+                lineHeightSlider.value = p.lineHeight || 1;
+                lineHeightSlider.style.cssText = `flex:1;height:4px;cursor:pointer;`;
+                
+                const lineHeightValue = document.createElement("span");
+                lineHeightValue.textContent = (p.lineHeight || 1).toFixed(1);
+                lineHeightValue.style.cssText = `color:#4CAF50;font-size:13px;white-space:nowrap;min-width:30px;text-align:right;font-family:Arial,sans-serif;`;
+
+                row2.appendChild(lineHeightLabel);
+                row2.appendChild(lineHeightSlider);
+                row2.appendChild(lineHeightValue);
+                
+                const row3 = document.createElement("div");
+                row3.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;`;
+                
+                const fontSizeGroup = document.createElement("div");
+                fontSizeGroup.style.cssText = `display:flex;align-items:center;gap:4px;`;
+                
+                const fontSizeLabel = document.createElement("span");
+                fontSizeLabel.textContent = "字号";
+                fontSizeLabel.style.cssText = `color:#aaa;font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;`;
+                
+                const fontSizeInput = document.createElement("input");
+                fontSizeInput.type = "text";
+                fontSizeInput.value = p.fontSize;
+                fontSizeInput.style.cssText = `width:40px;padding:3px 4px;border:1px solid #444;border-radius:4px;background:#2a2a2a;color:#4CAF50;font-size:13px;font-family:Arial,monospace;outline:none;text-align:center;`;
+                
+                fontSizeGroup.appendChild(fontSizeLabel);
+                fontSizeGroup.appendChild(fontSizeInput);
+                
+                const alignLabel = document.createElement("span");
+                alignLabel.textContent = "对齐";
+                alignLabel.style.cssText = `color:#aaa;font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;`;
+                
+                const alignGroup = document.createElement("div");
+                alignGroup.style.cssText = `display:flex;gap:2px;`;
+                
+                const alignBtnStyle = `padding:3px 8px;border:1px solid #444;border-radius:4px;background:#2a2a2a;color:#aaa;cursor:pointer;font-size:13px;font-family:Arial,sans-serif;`;
+                
+                const alignLeft = document.createElement("button");
+                alignLeft.textContent = "左";
+                alignLeft.style.cssText = alignBtnStyle + (p.textAlign === "left" ? "background:#4CAF50;color:#fff;border-color:#4CAF50;" : "");
+                
+                const alignCenter = document.createElement("button");
+                alignCenter.textContent = "中";
+                alignCenter.style.cssText = alignBtnStyle + (p.textAlign === "center" ? "background:#4CAF50;color:#fff;border-color:#4CAF50;" : "");
+                
+                const alignRight = document.createElement("button");
+                alignRight.textContent = "右";
+                alignRight.style.cssText = alignBtnStyle + (p.textAlign === "right" ? "background:#4CAF50;color:#fff;border-color:#4CAF50;" : "");
+                
+                alignGroup.appendChild(alignLeft);
+                alignGroup.appendChild(alignCenter);
+                alignGroup.appendChild(alignRight);
+                
+                const rightGroup = document.createElement("div");
+                rightGroup.style.cssText = `display:flex;align-items:center;gap:8px;`;
+                rightGroup.appendChild(alignLabel);
+                rightGroup.appendChild(alignGroup);
+                
+                row3.appendChild(fontSizeGroup);
+                row3.appendChild(rightGroup);
+                
+                const colorPanel = document.createElement("div");
+                colorPanel.style.cssText = `width:157px;flex-shrink:0;background:rgba(42,42,42,0.95);border:1px solid #444;border-left:none;border-radius:0 6px 6px 0;padding:8px;user-select:none;display:flex;flex-direction:column;align-items:stretch;align-self:flex-end;`;
+
+                const svCanvas = document.createElement("canvas");
+                svCanvas.width = 140;
+                svCanvas.height = 110;
+                svCanvas.style.cssText = `width:140px;flex:1;min-height:80px;border-radius:4px;cursor:crosshair;display:block;margin-bottom:6px;`;
+                
+                const hueCanvas = document.createElement("canvas");
+                hueCanvas.width = 140;
+                hueCanvas.height = 20;
+                hueCanvas.style.cssText = `width:140px;height:20px;border-radius:4px;cursor:pointer;display:block;margin-top:auto;`;
+                
+                colorPanel.appendChild(svCanvas);
+                colorPanel.appendChild(hueCanvas);
+                
+                colorPanel.addEventListener("mousedown", e => { e.stopPropagation(); e.preventDefault(); });
+                colorPanel.addEventListener("click", e => { e.stopPropagation(); });
+                
+                let currentHue = 0;
+                let currentSat = 1;
+                let currentVal = 1;
+                
+                const hexToHsv = (hex) => {
+                    const r = parseInt(hex.slice(1, 3), 16) / 255;
+                    const g = parseInt(hex.slice(3, 5), 16) / 255;
+                    const b = parseInt(hex.slice(5, 7), 16) / 255;
+                    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+                    let h, s, v = max;
+                    const d = max - min;
+                    s = max === 0 ? 0 : d / max;
+                    if (max === min) {
+                        h = 0;
+                    } else {
+                        switch (max) {
+                            case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+                            case g: h = (b - r) / d + 2; break;
+                            case b: h = (r - g) / d + 4; break;
+                        }
+                        h /= 6;
+                    }
+                    return { h: h * 360, s, v };
+                };
+                
+                const hsvToHex = (h, s, v) => {
+                    h /= 360;
+                    let r, g, b;
+                    const i = Math.floor(h * 6);
+                    const f = h * 6 - i;
+                    const p = v * (1 - s);
+                    const q = v * (1 - f * s);
+                    const t = v * (1 - (1 - f) * s);
+                    switch (i % 6) {
+                        case 0: r = v, g = t, b = p; break;
+                        case 1: r = q, g = v, b = p; break;
+                        case 2: r = p, g = v, b = t; break;
+                        case 3: r = p, g = q, b = v; break;
+                        case 4: r = t, g = p, b = v; break;
+                        case 5: r = v, g = p, b = q; break;
+                    }
+                    const toHex = x => {
+                        const hex = Math.round(x * 255).toString(16);
+                        return hex.length === 1 ? "0" + hex : hex;
+                    };
+                    return "#" + toHex(r) + toHex(g) + toHex(b);
+                };
+                
+                const drawHue = () => {
+                    const ctx = hueCanvas.getContext("2d");
+                    const w = hueCanvas.width, h = hueCanvas.height;
+                    const grad = ctx.createLinearGradient(0, 0, w, 0);
+                    grad.addColorStop(0, "#ff0000");
+                    grad.addColorStop(1 / 6, "#ffff00");
+                    grad.addColorStop(2 / 6, "#00ff00");
+                    grad.addColorStop(3 / 6, "#00ffff");
+                    grad.addColorStop(4 / 6, "#0000ff");
+                    grad.addColorStop(5 / 6, "#ff00ff");
+                    grad.addColorStop(1, "#ff0000");
+                    ctx.fillStyle = grad;
+                    ctx.fillRect(0, 0, w, h);
+                    const x = (currentHue / 360) * w;
+                    ctx.fillStyle = "#fff";
+                    ctx.beginPath();
+                    ctx.arc(x, h / 2, h / 2 - 1, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.strokeStyle = "#000";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.arc(x, h / 2, h / 2 - 1, 0, Math.PI * 2);
+                    ctx.stroke();
+                };
+                
+                const drawSV = () => {
+                    // 同步画布缓冲尺寸与CSS尺寸（适配flex:1高度变化）
+                    let cssH = svCanvas.clientHeight;
+                    if (cssH < 50) cssH = 110; // 布局未完成时使用默认高度
+                    if (svCanvas.height !== cssH) svCanvas.height = cssH;
+                    const ctx = svCanvas.getContext("2d");
+                    const w = svCanvas.width, h = svCanvas.height;
+                    const hueColor = hsvToHex(currentHue, 1, 1);
+                    const hGrad = ctx.createLinearGradient(0, 0, w, 0);
+                    hGrad.addColorStop(0, "#ffffff");
+                    hGrad.addColorStop(1, hueColor);
+                    ctx.fillStyle = hGrad;
+                    ctx.fillRect(0, 0, w, h);
+                    const vGrad = ctx.createLinearGradient(0, 0, 0, h);
+                    vGrad.addColorStop(0, "rgba(0,0,0,0)");
+                    vGrad.addColorStop(1, "#000000");
+                    ctx.fillStyle = vGrad;
+                    ctx.fillRect(0, 0, w, h);
+                    const x = currentSat * w;
+                    const y = (1 - currentVal) * h;
+                    ctx.fillStyle = "#fff";
+                    ctx.beginPath();
+                    ctx.arc(x, y, 5, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.strokeStyle = "#000";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.arc(x, y, 5, 0, Math.PI * 2);
+                    ctx.stroke();
+                };
+                
+                const updateColorFromHSV = () => {
+                    const hex = hsvToHex(currentHue, currentSat, currentVal);
+                    if (activeColorTarget === "glow") {
+                        p.glowColor = hex;
+                        glowColorBtn.style.background = hex;
+                        updateTextareaGlow();
+                    } else if (activeColorTarget === "bg") {
+                        p.bgColor = hex;
+                        refreshTextareaVisuals();
+                    } else {
+                        p.fontColor = hex;
+                        localStorage.setItem('rui_last_title_color', hex);
+                        refreshTextareaVisuals();
+                    }
+                    drawSV();
+                    drawHue();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+                
+                const initFromColor = (hex) => {
+                    const hsv = hexToHsv(hex);
+                    currentHue = hsv.h;
+                    currentSat = hsv.s;
+                    currentVal = hsv.v;
+                    drawSV();
+                };
+                
+                drawHue();
+                initFromColor(p.fontColor);
+                // 布局完成后重绘SV画布，修正初始椭圆圆点
+                requestAnimationFrame(() => { drawSV(); });
+                
+                let svDragging = false;
+                let hueDragging = false;
+                
+                const updateSVFromEvent = (e) => {
+                    const rect = svCanvas.getBoundingClientRect();
+                    let x = (e.clientX - rect.left) / rect.width;
+                    let y = (e.clientY - rect.top) / rect.height;
+                    x = Math.max(0, Math.min(1, x));
+                    y = Math.max(0, Math.min(1, y));
+                    currentSat = x;
+                    currentVal = 1 - y;
+                    updateColorFromHSV();
+                };
+                
+                // 左键拖拽调文字颜色，右键拖拽调背景颜色
+                const startHsvDrag = (e) => {
+                    if (e.button === 2) {
+                        activeColorTarget = "bg";
+                        glowColorBtn.style.borderColor = "#444";
+                        initFromColor(p.bgColor || "#2a2a2a");
+                    } else {
+                        activeColorTarget = "font";
+                        glowColorBtn.style.borderColor = "#444";
+                        initFromColor(p.fontColor);
+                    }
+                };
+
+                svCanvas.addEventListener("mousedown", (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    startHsvDrag(e);
+                    svDragging = true;
+                    updateSVFromEvent(e);
+                });
+                svCanvas.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); });
+                
+                document.addEventListener("mousemove", (e) => {
+                    if (svDragging) updateSVFromEvent(e);
+                });
+                
+                document.addEventListener("mouseup", () => {
+                    svDragging = false;
+                });
+                
+                const updateHueFromEvent = (e) => {
+                    const rect = hueCanvas.getBoundingClientRect();
+                    let x = (e.clientX - rect.left) / rect.width;
+                    x = Math.max(0, Math.min(1, x));
+                    currentHue = x * 360;
+                    drawSV();
+                    updateColorFromHSV();
+                };
+                
+                hueCanvas.addEventListener("mousedown", (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    startHsvDrag(e);
+                    hueDragging = true;
+                    updateHueFromEvent(e);
+                });
+                hueCanvas.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); });
+                
+                document.addEventListener("mousemove", (e) => {
+                    if (hueDragging) updateHueFromEvent(e);
+                });
+                
+                document.addEventListener("mouseup", () => {
+                    hueDragging = false;
+                });
+
+                const createToggleBtn = (label, enabled, activeColor, scale = 1) => {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    const updateBtn = (isOn, currentScale = scale) => {
+                        const s = currentScale;
+                        btn.innerHTML = `
+                            <span style="display:inline-flex;align-items:center;gap:${4 * s}px;pointer-events:none;white-space:nowrap;">
+                                <span style="font-size:${13 * s}px;pointer-events:none;white-space:nowrap;">${label}</span>
+                                <span class="toggle-track" style="display:inline-flex;align-items:center;width:${32 * s}px;height:${16 * s}px;border-radius:${8 * s}px;background:${isOn ? activeColor : '#555'};position:relative;transition:background 0.2s;pointer-events:none;">
+                                    <span class="toggle-thumb" style="position:absolute;left:${isOn ? 17 * s : 2 * s}px;top:${2 * s}px;width:${12 * s}px;height:${12 * s}px;border-radius:50%;background:#fff;transition:left 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.3);pointer-events:none;"></span>
+                                </span>
+                                <span style="font-size:${12 * s}px;color:${isOn ? activeColor : '#777'};font-weight:bold;min-width:${16 * s}px;pointer-events:none;">${isOn ? '开' : '关'}</span>
+                            </span>
+                        `;
+                        btn.style.cssText = `padding:${4 * s}px ${8 * s}px;border:none;border-radius:${4 * s}px;background:${isOn ? activeColor + '22' : '#333'};color:${isOn ? activeColor : '#aaa'};cursor:pointer;font-family:Arial,sans-serif;transition:all 0.2s;display:flex;align-items:center;flex-shrink:0;white-space:nowrap;`;
+                    };
+                    updateBtn(enabled);
+                    btn._update = updateBtn;
+                    return btn;
+                };
+                
+                // 三类功能主题色：背景红 / 辉光黄 / 炫彩绿
+                const THEME_COLOR = {
+                    bg:       "#FF5252", // 背景 → 红
+                    glow:     "#FFD700", // 辉光 → 黄
+                    rainbow:  "#4CAF50", // 炫彩 → 绿
+                };
+
+                const row4 = document.createElement("div");
+                row4.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;flex-wrap:nowrap;`;
+
+                const glowToggle = createToggleBtn("辉光", p.glowEnabled, THEME_COLOR.glow);
+
+                const glowSizeLabel = document.createElement("span");
+                glowSizeLabel.textContent = "大小";
+                glowSizeLabel.style.cssText = `color:${THEME_COLOR.glow};font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;margin-left:4px;`;
+
+                const glowSizeSlider = document.createElement("input");
+                glowSizeSlider.type = "range";
+                glowSizeSlider.min = "0";
+                glowSizeSlider.max = "50";
+                glowSizeSlider.step = "1";
+                glowSizeSlider.value = p.glowSize || 15;
+                glowSizeSlider.style.cssText = `flex:1;height:4px;cursor:pointer;min-width:40px;accent-color:${THEME_COLOR.glow};`;
+
+                const glowIntensityLabel = document.createElement("span");
+                glowIntensityLabel.textContent = "强度";
+                glowIntensityLabel.style.cssText = `color:${THEME_COLOR.glow};font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;margin-left:4px;`;
+
+                const glowIntensitySlider = document.createElement("input");
+                glowIntensitySlider.type = "range";
+                glowIntensitySlider.min = "0.1";
+                glowIntensitySlider.max = "3";
+                glowIntensitySlider.step = "0.1";
+                glowIntensitySlider.value = p.glowIntensity || 1;
+                glowIntensitySlider.style.cssText = `flex:1;height:4px;cursor:pointer;min-width:40px;accent-color:${THEME_COLOR.glow};`;
+
+                let activeColorTarget = "font";
+
+                const glowColorBtn = document.createElement("button");
+                glowColorBtn.style.cssText = `width:30px;height:24px;padding:0;border:2px solid #444;border-radius:3px;background:${p.glowColor || THEME_COLOR.glow};cursor:pointer;flex-shrink:0;display:${p.glowEnabled ? '' : 'none'};`;
+                glowColorBtn.title = "辉光颜色（点击弹出独立调色面板）";
+                glowColorBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    node._skipBlurClose = true;
+                    showGlowColorPicker();
+                });
+                glowColorBtn.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+
+                const bgRow = document.createElement("div");
+                bgRow.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;flex-wrap:nowrap;`;
+
+                const bgToggle = createToggleBtn("背景", p.bgEnabled, THEME_COLOR.bg);
+                bgToggle.title = "左键拖动调色框和色相条改变文字颜色，右键拖动改变背景色";
+                bgRow.appendChild(bgToggle);
+
+                const bgOpacityLabel = document.createElement("span");
+                bgOpacityLabel.textContent = "透明度";
+                bgOpacityLabel.style.cssText = `color:${THEME_COLOR.bg};font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;margin-left:4px;display:inline-block;text-align:left;min-width:42px;`;
+
+                const bgOpacitySlider = document.createElement("input");
+                bgOpacitySlider.type = "range";
+                bgOpacitySlider.min = "5";
+                bgOpacitySlider.max = "100";
+                bgOpacitySlider.step = "1";
+                bgOpacitySlider.value = Math.round((p.bgOpacity ?? 1) * 100);
+                bgOpacitySlider.style.cssText = `flex:1;height:4px;cursor:pointer;min-width:40px;accent-color:${THEME_COLOR.bg};`;
+
+                const bgRadiusLabel = document.createElement("span");
+                bgRadiusLabel.textContent = "圆角";
+                bgRadiusLabel.style.cssText = `color:${THEME_COLOR.bg};font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;margin-left:4px;display:inline-block;text-align:left;min-width:42px;`;
+
+                const bgRadiusSlider = document.createElement("input");
+                bgRadiusSlider.type = "range";
+                bgRadiusSlider.min = "0";
+                bgRadiusSlider.max = "200";
+                bgRadiusSlider.step = "1";
+                bgRadiusSlider.value = p.borderRadius ?? 8;
+                bgRadiusSlider.style.cssText = `flex:1;height:4px;cursor:pointer;min-width:40px;accent-color:${THEME_COLOR.bg};`;
+
+                // 透明度 Cell：标签 + 滑条
+                const bgOpacityCell = document.createElement("div");
+                bgOpacityCell.style.cssText = `display:flex;align-items:center;gap:8px;flex:1;min-width:0;`;
+                bgOpacityCell.appendChild(bgOpacityLabel);
+                bgOpacityCell.appendChild(bgOpacitySlider);
+
+                // 圆角 Cell：标签 + 滑条
+                const bgRadiusCell = document.createElement("div");
+                bgRadiusCell.style.cssText = `display:flex;align-items:center;gap:8px;flex:1;min-width:0;`;
+                bgRadiusCell.appendChild(bgRadiusLabel);
+                bgRadiusCell.appendChild(bgRadiusSlider);
+
+                // 垂直边距 Cell：标签 + 滑条
+                const bgPaddingLabel = document.createElement("span");
+                bgPaddingLabel.textContent = "垂直边距";
+                bgPaddingLabel.style.cssText = `color:${THEME_COLOR.bg};font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;margin-left:4px;display:inline-block;text-align:left;min-width:56px;`;
+
+                const bgPaddingSlider = document.createElement("input");
+                bgPaddingSlider.type = "range";
+                bgPaddingSlider.min = "0";
+                bgPaddingSlider.max = "200";
+                bgPaddingSlider.step = "1";
+                bgPaddingSlider.value = p.bgPadding ?? 4;
+                bgPaddingSlider.style.cssText = `flex:1;height:4px;cursor:pointer;min-width:40px;accent-color:${THEME_COLOR.bg};`;
+
+                const bgPaddingCell = document.createElement("div");
+                bgPaddingCell.style.cssText = `display:flex;align-items:center;gap:8px;flex:1;min-width:0;`;
+                bgPaddingCell.appendChild(bgPaddingLabel);
+                bgPaddingCell.appendChild(bgPaddingSlider);
+
+                // 透明度和圆角分两行，避免界面太宽
+                const bgControlsWrap = document.createElement("div");
+                bgControlsWrap.style.cssText = `display:${p.bgEnabled ? 'flex' : 'none'};flex-direction:column;gap:4px;flex:1;min-width:0;`;
+                bgControlsWrap.appendChild(bgOpacityCell);
+                bgControlsWrap.appendChild(bgRadiusCell);
+                bgControlsWrap.appendChild(bgPaddingCell);
+
+                bgRow.appendChild(bgControlsWrap);
+
+                // 大小 Cell：滑条尽力铺满
+                const glowSizeCell = document.createElement("div");
+                glowSizeCell.style.cssText = `display:flex;align-items:center;gap:8px;flex:1;min-width:0;`;
+                glowSizeCell.appendChild(glowSizeLabel);
+                glowSizeCell.appendChild(glowSizeSlider);
+
+                // 强度 Cell：滑条尽力铺满
+                const glowIntensityCell = document.createElement("div");
+                glowIntensityCell.style.cssText = `display:flex;align-items:center;gap:8px;flex:1;min-width:0;`;
+                glowIntensityCell.appendChild(glowIntensityLabel);
+                glowIntensityCell.appendChild(glowIntensitySlider);
+
+                const glowControlsWrap = document.createElement("div");
+                glowControlsWrap.style.cssText = `display:${p.glowEnabled ? 'flex' : 'none'};flex-direction:column;gap:4px;flex:1;min-width:0;`;
+                glowControlsWrap.appendChild(glowSizeCell);
+                glowControlsWrap.appendChild(glowIntensityCell);
+
+                row4.appendChild(glowToggle);
+                row4.appendChild(glowColorBtn);
+                row4.appendChild(glowControlsWrap);
+
+                const row5 = document.createElement("div");
+                row5.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;flex-wrap:nowrap;`;
+
+                const rainbowToggle = createToggleBtn("炫彩", p.rainbowEnabled, THEME_COLOR.rainbow);
+
+                const rainbowStyleLabel = document.createElement("span");
+                rainbowStyleLabel.textContent = "样式";
+                rainbowStyleLabel.style.cssText = `color:${THEME_COLOR.rainbow};font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;margin-left:4px;`;
+
+                const rainbowStyleSelect = document.createElement("select");
+                rainbowStyleSelect.style.cssText = `background:#2a2a2a;color:${THEME_COLOR.rainbow};border:1px solid ${THEME_COLOR.rainbow};border-radius:4px;padding:2px 4px;font-size:12px;cursor:pointer;`;
+                ["波浪", "呼吸", "透明渐变", "整体透明"].forEach(s => {
+                    const opt = document.createElement("option");
+                    opt.value = s; opt.textContent = s;
+                    if (s === (p.rainbowStyle || "波浪")) opt.selected = true;
+                    rainbowStyleSelect.appendChild(opt);
+                });
+                rainbowStyleSelect.addEventListener("change", (e) => {
+                    p.rainbowStyle = e.target.value;
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                });
+
+                const rainbowSpeedLabel = document.createElement("span");
+                rainbowSpeedLabel.textContent = "速度";
+                rainbowSpeedLabel.style.cssText = `color:${THEME_COLOR.rainbow};font-size:13px;white-space:nowrap;font-family:Arial,sans-serif;margin-left:4px;`;
+
+                const rainbowSpeedSlider = document.createElement("input");
+                rainbowSpeedSlider.type = "range";
+                rainbowSpeedSlider.min = "0.1";
+                rainbowSpeedSlider.max = "60";
+                rainbowSpeedSlider.step = "0.1";
+                rainbowSpeedSlider.value = p.rainbowSpeed ?? 30;
+                rainbowSpeedSlider.style.cssText = `flex:1;height:4px;cursor:pointer;min-width:40px;accent-color:${THEME_COLOR.rainbow};`;
+
+                const rainbowControlsWrap = document.createElement("div");
+                rainbowControlsWrap.style.cssText = `display:${p.rainbowEnabled ? 'flex' : 'none'};flex-direction:column;gap:4px;flex:1;min-width:0;`;
+                const rainbowStyleRow = document.createElement("div");
+                rainbowStyleRow.style.cssText = `display:flex;align-items:center;gap:8px;`;
+                rainbowStyleRow.appendChild(rainbowStyleLabel);
+                rainbowStyleRow.appendChild(rainbowStyleSelect);
+                rainbowControlsWrap.appendChild(rainbowStyleRow);
+                const rainbowSpeedRow = document.createElement("div");
+                rainbowSpeedRow.style.cssText = `display:flex;align-items:center;gap:8px;`;
+                rainbowSpeedRow.appendChild(rainbowSpeedLabel);
+                rainbowSpeedRow.appendChild(rainbowSpeedSlider);
+                rainbowControlsWrap.appendChild(rainbowSpeedRow);
+
+                row5.appendChild(rainbowToggle);
+                row5.appendChild(rainbowControlsWrap);
+
+                // 高级选项（背景、辉光、炫彩）折叠区域
+                const advancedToggle = createToggleBtn("高级", false, "#FFD700");
+                advancedToggle.style.background = 'transparent';
+                const origUpdate = advancedToggle._update;
+                advancedToggle._update = (isOn) => { origUpdate(isOn); advancedToggle.style.background = 'transparent'; };
+                const advancedRow = document.createElement("div");
+                advancedRow.style.cssText = `display:flex;align-items:center;gap:8px;padding:0 6px;flex-wrap:nowrap;margin-left:-2px;`;
+                advancedRow.appendChild(advancedToggle);
+
+                const helpBtn = document.createElement("button");
+                helpBtn.textContent = "使用说明";
+                helpBtn.style.cssText = `background:none;border:none;color:#FFD700;cursor:pointer;font-size:12px;font-family:Arial,sans-serif;padding:4px 6px;border-radius:4px;transition:color 0.2s;white-space:nowrap;`;
+                helpBtn.addEventListener("mouseenter", () => { helpBtn.style.color = '#FFA500'; });
+                helpBtn.addEventListener("mouseleave", () => { helpBtn.style.color = '#FFD700'; });
+                helpBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    const overlay = document.createElement("div");
+                    overlay.style.cssText = `position:fixed;left:0;top:0;width:100%;height:100%;z-index:100001;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);`;
+                    const box = document.createElement("div");
+                    box.style.cssText = `background:#2a2a2a;border:1px solid #555;border-radius:10px;padding:28px 36px;max-width:700px;box-shadow:0 8px 32px rgba(0,0,0,0.6);color:#ddd;font-size:15px;line-height:2;font-family:Arial,sans-serif;display:flex;flex-direction:column;justify-content:center;`;
+                    box.innerHTML = `点击"背景"按钮开启<br>背景选项：透明度、圆角、垂直边距<br>左键拖动调色框和色相条 → 改变文字颜色<br><span style="white-space:nowrap;"><span style="color:#FFD700;">右键</span>拖动调色框和色相条 → 改变背景色</span>`;
+                    overlay.appendChild(box);
+                    document.body.appendChild(overlay);
+                    overlay.addEventListener("click", () => overlay.remove());
+                });
+                advancedRow.appendChild(helpBtn);
+
+                const advancedWrap = document.createElement("div");
+                const anyAdvancedOn = p.bgEnabled || p.glowEnabled || p.rainbowEnabled;
+                advancedWrap.style.cssText = `display:${anyAdvancedOn ? 'flex' : 'none'};flex-direction:column;`;
+                advancedRow.style.display = anyAdvancedOn ? 'none' : 'flex';
+                if (anyAdvancedOn) advancedToggle._update(true);
+                advancedWrap.appendChild(bgRow);
+                advancedWrap.appendChild(rowSeparator());
+                advancedWrap.appendChild(row4);
+                advancedWrap.appendChild(rowSeparator());
+                advancedWrap.appendChild(row5);
+
+                leftPanel.appendChild(advancedRow);
+                leftPanel.appendChild(advancedWrap);
+                leftPanel.appendChild(row1);
+                leftPanel.appendChild(rowSeparator());
+                leftPanel.appendChild(rowLetterSpacing);
+                leftPanel.appendChild(rowSeparator());
+                leftPanel.appendChild(row2);
+                leftPanel.appendChild(rowSeparator());
+                leftPanel.appendChild(row3);
+                leftPanel.appendChild(rowSeparator());
+
+                const presetsRow = document.createElement("div");
+                presetsRow.style.cssText = `display:flex;align-items:center;gap:6px;padding:0 6px;`;
+
+                const presetsLabel = document.createElement("span");
+                presetsLabel.textContent = "预设";
+                presetsLabel.style.cssText = `color:#aaa;font-size:12px;white-space:nowrap;font-family:Arial,sans-serif;min-width:28px;`;
+
+                const presetsContainer = document.createElement("div");
+                presetsContainer.style.cssText = `display:flex;gap:3px;flex:1;min-width:0;`;
+
+                const getTitlePresets = () => {
+                    try {
+                        const stored = localStorage.getItem("rui_title_presets");
+                        if (stored) {
+                            const presets = JSON.parse(stored);
+                            if (Array.isArray(presets) && presets.length === 5) {
+                                return presets;
+                            }
+                        }
+                    } catch (e) {}
+                    return [null, null, null, null, null];
+                };
+
+                const saveTitlePresets = (presets) => {
+                    try {
+                        localStorage.setItem("rui_title_presets", JSON.stringify(presets));
+                    } catch (e) {}
+                };
+
+                const renderTitlePresets = () => {
+                    const presets = getTitlePresets();
+                    const rainbowGradient = 'linear-gradient(90deg, #ff0000, #00ff00, #0000ff)';
+                    presetsContainer.querySelectorAll(".xz-title-preset-item").forEach((item, index) => {
+                        const preset = presets[index];
+                        const swatch = item.querySelector(".xz-title-preset-swatch");
+                        const sizeLabel = item.querySelector(".xz-title-preset-size");
+                        if (preset) {
+                            if (preset.rainbowEnabled) {
+                                // 炫彩开启时显示七彩虹渐变
+                                swatch.style.background = rainbowGradient;
+                            } else {
+                                swatch.style.background = preset.fontColor || "#ffffff";
+                            }
+                            if (sizeLabel) {
+                                sizeLabel.textContent = preset.fontSize || 14;
+                                sizeLabel.style.color = preset.rainbowEnabled ? "#ff4444" : "#4CAF50";
+                            }
+                            item.style.borderStyle = "solid";
+                            item.title = preset.rainbowEnabled
+                                ? `预设${index + 1}：${preset.fontSize || 14}px（炫彩）`
+                                : `预设${index + 1}：${preset.fontSize || 14}px`;
+                        } else {
+                            if (swatch) swatch.style.background = "#333";
+                            if (sizeLabel) {
+                                sizeLabel.textContent = "—";
+                                sizeLabel.style.color = "#666";
+                            }
+                            item.style.borderStyle = "dashed";
+                            item.title = `预设${index + 1}（右键保存）`;
+                        }
+                    });
+                };
+
+                const applyTitlePreset = (index) => {
+                    const presets = getTitlePresets();
+                    const preset = presets[index];
+                    if (!preset) return;
+
+                    if (preset.fontSize !== undefined) {
+                        updateFontSize(preset.fontSize);
+                    }
+                    if (preset.fontColor !== undefined) {
+                        p.fontColor = preset.fontColor;
+                        localStorage.setItem('rui_last_title_color', preset.fontColor);
+                        if (activeColorTarget === "font") {
+                            initFromColor(preset.fontColor);
+                        }
+                    }
+                    if (preset.textAlign !== undefined) {
+                        updateTextAlign(preset.textAlign);
+                    }
+                    if (preset.letterSpacing !== undefined) {
+                        updateLetterSpacing(preset.letterSpacing);
+                    }
+                    if (preset.lineHeight !== undefined) {
+                        updateLineHeight(preset.lineHeight);
+                    }
+                    if (preset.bgEnabled !== undefined) {
+                        p.bgEnabled = preset.bgEnabled;
+                        bgToggle._update(p.bgEnabled);
+                        bgControlsWrap.style.display = p.bgEnabled ? 'flex' : 'none';
+                    }
+                    if (preset.bgColor !== undefined) {
+                        p.bgColor = preset.bgColor;
+                        if (activeColorTarget === "bg") {
+                            initFromColor(preset.bgColor);
+                        }
+                    }
+                    if (preset.bgOpacity !== undefined) {
+                        p.bgOpacity = preset.bgOpacity;
+                        bgOpacitySlider.value = Math.round(preset.bgOpacity * 100);
+                    }
+                    if (preset.borderRadius !== undefined) {
+                        p.borderRadius = preset.borderRadius;
+                        bgRadiusSlider.value = preset.borderRadius;
+                        ta.style.borderRadius = preset.borderRadius * (getNodeViewportRect(node)?.scale || 1) + "px";
+                    }
+                    if (preset.bgPadding !== undefined) {
+                        p.bgPadding = preset.bgPadding;
+                        bgPaddingSlider.value = preset.bgPadding;
+                    }
+                    if (preset.glowEnabled !== undefined) {
+                        p.glowEnabled = preset.glowEnabled;
+                        glowToggle._update(p.glowEnabled);
+                        glowControlsWrap.style.display = p.glowEnabled ? 'flex' : 'none';
+                        glowColorBtn.style.display = p.glowEnabled ? '' : 'none';
+                        updateTextareaGlow();
+                    }
+                    if (preset.glowColor !== undefined) {
+                        p.glowColor = preset.glowColor;
+                        glowColorBtn.style.background = preset.glowColor;
+                        if (activeColorTarget === "glow") {
+                            initFromColor(preset.glowColor);
+                        }
+                        updateTextareaGlow();
+                    }
+                    if (preset.glowSize !== undefined) {
+                        p.glowSize = preset.glowSize;
+                        glowSizeSlider.value = preset.glowSize;
+                        updateTextareaGlow();
+                    }
+                    if (preset.glowIntensity !== undefined) {
+                        p.glowIntensity = preset.glowIntensity;
+                        glowIntensitySlider.value = preset.glowIntensity;
+                        updateTextareaGlow();
+                    }
+                    if (preset.rainbowEnabled !== undefined) {
+                        p.rainbowEnabled = preset.rainbowEnabled;
+                        rainbowToggle._update(p.rainbowEnabled);
+                        rainbowControlsWrap.style.display = p.rainbowEnabled ? 'flex' : 'none';
+                    }
+                    if (preset.rainbowStyle !== undefined) {
+                        p.rainbowStyle = preset.rainbowStyle;
+                        rainbowStyleSelect.value = preset.rainbowStyle;
+                    }
+                    if (preset.rainbowSpeed !== undefined) {
+                        p.rainbowSpeed = preset.rainbowSpeed;
+                        rainbowSpeedSlider.value = preset.rainbowSpeed;
+                    }
+                    node.adjustHeightToContent();
+                    refreshTextareaVisuals();
+                    saveLastTitleConfig(p);
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const showTitleConfirmDialog = (title, message) => {
+                    return new Promise((resolve) => {
+                        if (!document.getElementById("rui-dialog-global-css")) {
+                            const s = document.createElement("style");
+                            s.id = "rui-dialog-global-css";
+                            s.textContent = `
+                                .rui-wf-dialog-overlay {
+                                    position: fixed;top: 0;left: 0;right: 0;bottom: 0;
+                                    background: rgba(0, 0, 0, 0.6);
+                                    display: flex;align-items: center;justify-content: center;
+                                    z-index: 100002;
+                                }
+                                .rui-wf-dialog {
+                                    background: var(--comfy-menu-bg, #2a2a2a);
+                                    border: 1px solid var(--border-color, #555);
+                                    border-radius: 8px;min-width: 320px;
+                                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+                                }
+                                .rui-wf-dialog-title {
+                                    position: relative;display: flex;align-items: center;justify-content: center;
+                                    padding: 14px 16px;font-size: 15px;font-weight: bold;color: #fff;
+                                    border-bottom: 1px solid var(--border-color, #444);text-align: center;
+                                }
+                                .rui-wf-dialog-body { padding: 20px 16px; }
+                                .rui-wf-dialog-footer {
+                                    padding: 12px 16px;border-top: 1px solid var(--border-color, #444);
+                                    display: flex;justify-content: center;gap: 10px;
+                                }
+                                .rui-wf-dialog-btn {
+                                    padding: 6px 16px;font-size: 13px;
+                                    background: var(--comfy-input-bg, #3a3a3a);
+                                    color: var(--fg, #ddd);
+                                    border: 1px solid var(--border-color, #555);
+                                    border-radius: 4px;cursor: pointer;transition: all 0.15s;
+                                }
+                                .rui-wf-dialog-btn:hover { background: rgba(255, 255, 255, 0.1); }
+                                .rui-wf-dialog-btn-cancel {
+                                    background: var(--comfy-input-bg, #3a3a3a);color: var(--fg, #ddd);
+                                }
+                                .rui-wf-dialog-btn-confirm {
+                                    background: #4a4a4a;color: #fff;border-color: #666;font-weight: bold;
+                                }
+                                .rui-wf-dialog-btn-confirm:hover:not(:disabled) { background: rgba(255, 255, 255, 0.1); }
+                                .rui-wf-dialog-btn-confirm:disabled { opacity: 0.4;cursor: not-allowed; }
+                            `;
+                            document.head.appendChild(s);
+                        }
+                        const escapeAttr = (v) => String(v == null ? "" : v)
+                            .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+                            .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+                        const overlay = document.createElement("div");
+                        overlay.className = "rui-wf-dialog-overlay";
+                        overlay.style.zIndex = "100003";
+                        overlay.innerHTML = `
+                            <div class="rui-wf-dialog" style="min-width:320px;max-width:420px;">
+                                <div class="rui-wf-dialog-title" style="color:#FFD700;">${escapeAttr(title)}</div>
+                                <div class="rui-wf-dialog-body" style="padding:18px 20px;font-size:13px;color:#ddd;line-height:1.6;">
+                                    ${escapeAttr(message)}
+                                </div>
+                                <div class="rui-wf-dialog-footer">
+                                    <button class="rui-wf-dialog-btn rui-wf-dialog-btn-cancel" id="rui-title-confirm-cancel">取消</button>
+                                    <button class="rui-wf-dialog-btn rui-wf-dialog-btn-confirm" id="rui-title-confirm-ok" style="background:#FFD700;color:#333;border-color:#FFD700;">确认</button>
+                                </div>
+                            </div>
+                        `;
+                        document.body.appendChild(overlay);
+
+                        const dialogEl = overlay.querySelector(".rui-wf-dialog");
+
+                        const stopAll = (e) => { e.stopPropagation(); e.preventDefault(); };
+                        overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) { e.stopPropagation(); } });
+                        if (dialogEl) {
+                            dialogEl.addEventListener("mousedown", stopAll);
+                            dialogEl.addEventListener("pointerdown", stopAll);
+                            dialogEl.addEventListener("click", (e) => e.stopPropagation());
+                        }
+
+                        const finish = (result) => {
+                            document.removeEventListener("keydown", onKey, true);
+                            overlay.remove();
+                            resolve(result);
+                        };
+
+                        const onKey = (e) => {
+                            if (e.key === "Escape") {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                finish(false);
+                            } else if (e.key === "Enter") {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                finish(true);
+                            }
+                        };
+                        document.addEventListener("keydown", onKey, true);
+
+                        overlay.querySelector("#rui-title-confirm-cancel").addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); finish(false); });
+                        overlay.querySelector("#rui-title-confirm-ok").addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); finish(true); });
+                        overlay.addEventListener("click", (e) => {
+                            if (e.target === overlay) { e.stopPropagation(); e.preventDefault(); finish(false); }
+                        });
+                    });
+                };
+
+                const saveCurrentToTitlePreset = (index) => {
+                    const presets = getTitlePresets();
+                    presets[index] = {
+                        fontSize: p.fontSize,
+                        fontColor: p.fontColor,
+                        textAlign: p.textAlign,
+                        letterSpacing: p.letterSpacing,
+                        lineHeight: p.lineHeight,
+                        bgEnabled: p.bgEnabled,
+                        bgColor: p.bgColor,
+                        bgOpacity: p.bgOpacity,
+                        borderRadius: p.borderRadius,
+                        bgPadding: p.bgPadding,
+                        glowEnabled: p.glowEnabled,
+                        glowColor: p.glowColor,
+                        glowSize: p.glowSize,
+                        glowIntensity: p.glowIntensity,
+                        rainbowEnabled: p.rainbowEnabled,
+                        rainbowStyle: p.rainbowStyle,
+                        rainbowSpeed: p.rainbowSpeed,
+                    };
+                    saveLastTitleConfig(p);
+                    saveTitlePresets(presets);
+                    renderTitlePresets();
+                };
+
+                for (let i = 0; i < 5; i++) {
+                    const presetItem = document.createElement("div");
+                    presetItem.className = "xz-title-preset-item";
+                    presetItem.dataset.preset = i;
+                    presetItem.style.cssText = `display:flex;height:20px;flex:1;min-width:0;border-radius:3px;cursor:pointer;border:1.5px solid #444;transition:all 0.2s;position:relative;overflow:hidden;`;
+
+                    const sizeLabel = document.createElement("span");
+                    sizeLabel.className = "xz-title-preset-size";
+                    sizeLabel.style.cssText = `display:flex;align-items:center;justify-content:center;width:22px;flex-shrink:0;font-size:11px;font-weight:bold;font-family:Arial,sans-serif;color:#4CAF50;background:#2a2a2a;border-right:1px solid #444;`;
+                    sizeLabel.textContent = "—";
+
+                    const swatch = document.createElement("div");
+                    swatch.className = "xz-title-preset-swatch";
+                    swatch.style.cssText = `flex:1;height:100%;background:#333;`;
+
+                    presetItem.appendChild(sizeLabel);
+                    presetItem.appendChild(swatch);
+
+                    presetItem.addEventListener("mousedown", (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                    });
+                    presetItem.addEventListener("click", (e) => {
+                        e.stopPropagation();
+                        applyTitlePreset(i);
+                    });
+                    presetItem.addEventListener("contextmenu", async (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const confirmed = await showTitleConfirmDialog(
+                            "保存预设",
+                            `确定要将当前标题设置保存到预设${i + 1}吗？`
+                        );
+                        if (confirmed) {
+                            saveCurrentToTitlePreset(i);
+                        }
+                    });
+                    presetsContainer.appendChild(presetItem);
+                }
+
+                presetsRow.appendChild(presetsLabel);
+                presetsRow.appendChild(presetsContainer);
+                leftPanel.appendChild(presetsRow);
+
+                const presetsTipRow = document.createElement("div");
+                presetsTipRow.style.cssText = `text-align:center;color:#888;font-size:10px;margin-top:2px;padding:0 6px;font-family:Arial,sans-serif;`;
+                presetsTipRow.textContent = "左键应用，右键保存当前设置";
+                leftPanel.appendChild(presetsTipRow);
+
+                renderTitlePresets();
+
+                toolbar.appendChild(leftPanel);
+                toolbar.appendChild(colorPanel);
+                container.appendChild(toolbar);
+                container.appendChild(ta);
+                
+                node.editTextarea = container;
+                node._editTextareaEl = ta;
+                document.body.appendChild(container);
+                
+                requestAnimationFrame(() => { 
+                    ta.focus({ preventScroll: true }); 
+                    requestAnimationFrame(() => {
+                        ta.setSelectionRange(0, ta.value.length);
+                    });
+                });
+
+                let _focusTries = 0;
+                const _focusTick = () => {
+                    if (!node.editTextarea || ++_focusTries > 8 || node._removed) { node._focusGuard = null; return; }
+                    if (node._composing) { node._focusGuard = requestAnimationFrame(_focusTick); return; }
+                    const ae = document.activeElement;
+                    if (colorPanel.contains(ae)) { node._focusGuard = requestAnimationFrame(_focusTick); return; }
+                    if (advancedWrap.contains(ae) || bgRow.contains(ae) || row4.contains(ae) || row5.contains(ae)) { node._focusGuard = requestAnimationFrame(_focusTick); return; }
+                    if (ae !== ta && ae !== slider && ae !== letterSpacingSlider && ae !== lineHeightSlider && ae !== alignLeft && ae !== alignCenter && ae !== alignRight && ae !== glowToggle && ae !== glowSizeSlider && ae !== glowIntensitySlider && ae !== glowColorBtn && ae !== rainbowToggle && ae !== rainbowSpeedSlider && ae !== bgToggle && ae !== bgOpacitySlider && ae !== bgRadiusSlider && ae !== advancedToggle) { ta.focus({ preventScroll: true }); }
+                    node._focusGuard = requestAnimationFrame(_focusTick);
+                };
+                node._focusGuard = requestAnimationFrame(_focusTick);
+                node._blurRetries = 0;
+
+                const updateFontSize = (size) => {
+                    const s = parseFloat(size) || 16;
+                    p.fontSize = s;
+                    localStorage.setItem('rui_last_title_font_size', s);
+                    const nr = getNodeViewportRect(node);
+                    const scale = nr ? nr.scale : 1;
+                    ta.style.fontSize = s * scale + "px";
+                    ta.style.lineHeight = s * scale * (p.lineHeight || 1) + "px";
+                    ta.style.padding = calcTitlePad(p, scale) + "px 0";
+                    if (s <= 300) {
+                        slider.value = s;
+                    }
+                    sliderValue.textContent = s + "px";
+                    fontSizeInput.value = s;
+                    node.adjustHeightToContent();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const showToast = (msg) => {
+                    const existing = document.getElementById("rui-title-toast");
+                    if (existing) existing.remove();
+                    const toast = document.createElement("div");
+                    toast.id = "rui-title-toast";
+                    toast.textContent = msg;
+                    toast.style.cssText = `position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:100002;background:rgba(0,0,0,0.8);color:#FFD700;font-size:14px;padding:10px 20px;border-radius:8px;font-family:Arial,sans-serif;pointer-events:none;white-space:nowrap;`;
+                    document.body.appendChild(toast);
+                    setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 1500);
+                };
+
+                const updateTextAlign = (align) => {
+                    p.textAlign = align;
+                    ta.style.textAlign = align;
+                    if (align === "left") {
+                        alignLeft.style.cssText = alignBtnStyle + "background:#4CAF50;color:#fff;border-color:#4CAF50;";
+                        alignCenter.style.cssText = alignBtnStyle;
+                        alignRight.style.cssText = alignBtnStyle;
+                    } else {
+                        alignLeft.style.cssText = alignBtnStyle;
+                        alignCenter.style.cssText = alignBtnStyle + (align === "center" ? "background:#4CAF50;color:#fff;border-color:#4CAF50;" : "");
+                        alignRight.style.cssText = alignBtnStyle + (align === "right" ? "background:#4CAF50;color:#fff;border-color:#4CAF50;" : "");
+                    }
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateLineHeight = (value) => {
+                    const v = parseFloat(value) || 1;
+                    p.lineHeight = v;
+                    lineHeightValue.textContent = v.toFixed(1);
+                    lineHeightSlider.value = v;
+                    const currentScale = getNodeViewportRect(node)?.scale || 1;
+                    ta.style.lineHeight = p.fontSize * currentScale * v + "px";
+                    ta.style.padding = calcTitlePad(p, currentScale) + "px 0";
+                    node.adjustHeightToContent();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateLetterSpacing = (value) => {
+                    const v = parseFloat(value) || 0;
+                    p.letterSpacing = v;
+                    letterSpacingValue.textContent = v.toFixed(1) + "px";
+                    const currentScale = getNodeViewportRect(node)?.scale || 1;
+                    ta.style.letterSpacing = (v * currentScale) + "px";
+                    node.adjustHeightToContent();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const saveClose = () => {
+                    if (!node.editTextarea) return;
+                    p.text = ta.value;
+                    saveLastTitleConfig(p);
+                    removeTitleEditor(node);
+                    node.adjustHeightToContent();
+                    node.setDirtyCanvas?.(true, true);
+                    window.app?.graph?.setDirtyCanvas(true);
+                };
+
+                const _posTick = () => {
+                    if (!node.editTextarea) { node._posRaf = null; return; }
+                    const nr = getNodeViewportRect(node);
+                    if (nr) {
+                        const s = nr.scale;
+                        container.style.left = nr.left + "px";
+                        container.style.top = nr.top + "px";
+                        container.style.width = Math.max(50, node.size[0] * s) + "px";
+                        ta.style.height = Math.max(18, node.size[1] * s) + "px";
+                        ta.style.fontSize = p.fontSize * s + "px";
+                        ta.style.lineHeight = p.fontSize * s * (p.lineHeight || 1) + "px";
+                        ta.style.letterSpacing = (p.letterSpacing || 0) * s + "px";
+                        ta.style.borderRadius = (p.borderRadius ?? 8) * s + "px";
+                        ta.style.padding = calcTitlePad(p, s) + "px 0";
+                    }
+                    node._posRaf = requestAnimationFrame(_posTick);
+                };
+                node._posRaf = requestAnimationFrame(_posTick);
+
+                slider.addEventListener("input", (e) => {
+                    updateFontSize(e.target.value);
+                    sliderValue.textContent = e.target.value + "px";
+                });
+                
+                slider.addEventListener("mousedown", (e) => {
+                    e.stopPropagation();
+                });
+                
+                slider.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                });
+                
+                alignLeft.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    updateTextAlign("left");
+                });
+                alignCenter.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    updateTextAlign("center");
+                });
+                alignRight.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    updateTextAlign("right");
+                });
+
+                alignLeft.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                alignCenter.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                alignRight.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+
+                lineHeightSlider.addEventListener("input", (e) => {
+                    updateLineHeight(e.target.value);
+                    lineHeightValue.textContent = parseFloat(e.target.value).toFixed(1);
+                });
+                lineHeightSlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                lineHeightSlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                letterSpacingSlider.addEventListener("input", (e) => {
+                    updateLetterSpacing(e.target.value);
+                    letterSpacingValue.textContent = parseFloat(e.target.value).toFixed(1) + "px";
+                });
+                letterSpacingSlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                letterSpacingSlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                fontSizeInput.addEventListener("input", (e) => {
+                    const val = parseFloat(e.target.value);
+                    if (!isNaN(val) && val >= 8 && val <= 300) {
+                        updateFontSize(val);
+                        if (val <= 300) {
+                            slider.value = val;
+                        }
+                    }
+                });
+                fontSizeInput.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                fontSizeInput.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                const updateTextareaGlow = () => {
+                    if (p.glowEnabled) {
+                        const blur = (p.glowSize || 15) * (p.glowIntensity || 1);
+                        ta.style.boxShadow = `inset 0 0 ${blur}px ${blur / 2}px ${p.glowColor || "#FFD700"}`;
+                    } else {
+                        ta.style.boxShadow = "";
+                    }
+                };
+
+                // 刷新 textarea 视觉：文字颜色、背景色、彩虹效果
+                const refreshTextareaVisuals = () => {
+                    // textarea 仅负责输入和光标定位，视觉渲染全部由 canvas 处理
+                    ta.style.color = 'transparent';
+                    ta.style.caretColor = '#00ff6a';
+                    ta.style.background = 'transparent';
+                    ta.style.webkitTextFillColor = 'transparent';
+                    ta.style.backgroundImage = '';
+                    ta.style.backgroundColor = 'transparent';
+                };
+
+                // 初始化：根据当前 p 状态应用视觉（彩虹/背景/文字颜色）
+                refreshTextareaVisuals();
+
+                const checkAutoCollapseAdvanced = () => {
+                    if (!p.bgEnabled && !p.glowEnabled && !p.rainbowEnabled) {
+                        advancedWrap.style.display = 'none';
+                        advancedRow.style.display = 'flex';
+                        advancedToggle._update(false);
+                    }
+                };
+
+                const updateGlowEnabled = (enabled) => {
+                    p.glowEnabled = enabled;
+                    glowToggle._update(enabled);
+                    glowControlsWrap.style.display = enabled ? 'flex' : 'none';
+                    glowColorBtn.style.display = enabled ? '' : 'none';
+                    updateTextareaGlow();
+                    if (!enabled) checkAutoCollapseAdvanced();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateGlowSize = (size) => {
+                    const s = parseFloat(size) || 15;
+                    p.glowSize = s;
+                    updateTextareaGlow();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateGlowIntensity = (intensity) => {
+                    const i = parseFloat(intensity) || 1;
+                    p.glowIntensity = i;
+                    updateTextareaGlow();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateGlowColor = (color) => {
+                    p.glowColor = color;
+                    glowColorBtn.style.background = color;
+                    updateTextareaGlow();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                // ====== 辉光独立调色面板（避免与文字颜色/背景颜色冲突） ======
+                const showGlowColorPicker = () => {
+                    const existing = document.getElementById("rui-glow-color-picker");
+                    if (existing) { existing.remove(); return; }
+
+                    const picker = document.createElement("div");
+                    picker.id = "rui-glow-color-picker";
+                    picker.style.cssText = `position:fixed;z-index:100001;background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:8px;box-shadow:0 4px 16px rgba(0,0,0,0.5);user-select:none;`;
+
+                    const rect = glowColorBtn.getBoundingClientRect();
+                    let left = rect.left;
+                    let top = rect.bottom + 4;
+                    picker.style.left = left + "px";
+                    picker.style.top = top + "px";
+
+                    const pickerTitle = document.createElement("div");
+                    pickerTitle.textContent = "辉光颜色";
+                    pickerTitle.style.cssText = `color:#4CAF50;font-size:12px;text-align:center;margin-bottom:6px;font-family:Arial,sans-serif;`;
+                    picker.appendChild(pickerTitle);
+
+                    const gSvCanvas = document.createElement("canvas");
+                    gSvCanvas.width = 140;
+                    gSvCanvas.height = 105;
+                    gSvCanvas.style.cssText = `width:140px;height:105px;border-radius:4px;cursor:crosshair;display:block;margin-bottom:6px;`;
+
+                    const gHueCanvas = document.createElement("canvas");
+                    gHueCanvas.width = 140;
+                    gHueCanvas.height = 20;
+                    gHueCanvas.style.cssText = `width:140px;height:20px;border-radius:4px;cursor:pointer;display:block;`;
+
+                    picker.appendChild(gSvCanvas);
+                    picker.appendChild(gHueCanvas);
+                    document.body.appendChild(picker);
+
+                    picker.addEventListener("mousedown", e => { e.stopPropagation(); e.preventDefault(); });
+                    picker.addEventListener("click", e => { e.stopPropagation(); });
+
+                    let gHue = 0, gSat = 1, gVal = 1;
+
+                    const gHexToHsv = (hex) => {
+                        const r = parseInt(hex.slice(1, 3), 16) / 255;
+                        const g = parseInt(hex.slice(3, 5), 16) / 255;
+                        const b = parseInt(hex.slice(5, 7), 16) / 255;
+                        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+                        let h, s, v = max;
+                        const d = max - min;
+                        s = max === 0 ? 0 : d / max;
+                        if (max === min) { h = 0; }
+                        else {
+                            switch (max) {
+                                case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+                                case g: h = (b - r) / d + 2; break;
+                                case b: h = (r - g) / d + 4; break;
+                            }
+                            h /= 6;
+                        }
+                        return { h: h * 360, s, v };
+                    };
+
+                    const gHsvToHex = (h, s, v) => {
+                        h /= 360;
+                        let r, g, b;
+                        const i = Math.floor(h * 6);
+                        const f = h * 6 - i;
+                        const p = v * (1 - s);
+                        const q = v * (1 - f * s);
+                        const t = v * (1 - (1 - f) * s);
+                        switch (i % 6) {
+                            case 0: r = v, g = t, b = p; break;
+                            case 1: r = q, g = v, b = p; break;
+                            case 2: r = p, g = v, b = t; break;
+                            case 3: r = p, g = q, b = v; break;
+                            case 4: r = t, g = p, b = v; break;
+                            case 5: r = v, g = p, b = q; break;
+                        }
+                        const toHex = x => { const hx = Math.round(x * 255).toString(16); return hx.length === 1 ? "0" + hx : hx; };
+                        return "#" + toHex(r) + toHex(g) + toHex(b);
+                    };
+
+                    const drawGHue = () => {
+                        const ctx = gHueCanvas.getContext("2d");
+                        const w = gHueCanvas.width, h = gHueCanvas.height;
+                        const grad = ctx.createLinearGradient(0, 0, w, 0);
+                        grad.addColorStop(0, "#ff0000");
+                        grad.addColorStop(1 / 6, "#ffff00");
+                        grad.addColorStop(2 / 6, "#00ff00");
+                        grad.addColorStop(3 / 6, "#00ffff");
+                        grad.addColorStop(4 / 6, "#0000ff");
+                        grad.addColorStop(5 / 6, "#ff00ff");
+                        grad.addColorStop(1, "#ff0000");
+                        ctx.fillStyle = grad;
+                        ctx.fillRect(0, 0, w, h);
+                        const x = (gHue / 360) * w;
+                        ctx.fillStyle = "#fff";
+                        ctx.beginPath();
+                        ctx.arc(x, h / 2, h / 2 - 1, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.strokeStyle = "#000";
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.arc(x, h / 2, h / 2 - 1, 0, Math.PI * 2);
+                        ctx.stroke();
+                    };
+
+                    const drawGSV = () => {
+                        const ctx = gSvCanvas.getContext("2d");
+                        const w = gSvCanvas.width, h = gSvCanvas.height;
+                        const hueColor = gHsvToHex(gHue, 1, 1);
+                        const hGrad = ctx.createLinearGradient(0, 0, w, 0);
+                        hGrad.addColorStop(0, "#ffffff");
+                        hGrad.addColorStop(1, hueColor);
+                        ctx.fillStyle = hGrad;
+                        ctx.fillRect(0, 0, w, h);
+                        const vGrad = ctx.createLinearGradient(0, 0, 0, h);
+                        vGrad.addColorStop(0, "rgba(0,0,0,0)");
+                        vGrad.addColorStop(1, "#000000");
+                        ctx.fillStyle = vGrad;
+                        ctx.fillRect(0, 0, w, h);
+                        const x = gSat * w;
+                        const y = (1 - gVal) * h;
+                        ctx.fillStyle = "#fff";
+                        ctx.beginPath();
+                        ctx.arc(x, y, 5, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.strokeStyle = "#000";
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.arc(x, y, 5, 0, Math.PI * 2);
+                        ctx.stroke();
+                    };
+
+                    const updateGColor = () => {
+                        const hex = gHsvToHex(gHue, gSat, gVal);
+                        updateGlowColor(hex);
+                        drawGSV();
+                        drawGHue();
+                    };
+
+                    const initGFromColor = (hex) => {
+                        const hsv = gHexToHsv(hex);
+                        gHue = hsv.h;
+                        gSat = hsv.s;
+                        gVal = hsv.v;
+                        drawGSV();
+                    };
+
+                    drawGHue();
+                    initGFromColor(p.glowColor || "#FFD700");
+                    requestAnimationFrame(() => { drawGSV(); });
+
+                    let gSvDragging = false, gHueDragging = false;
+
+                    const updateGSVFromEvent = (e) => {
+                        const rect = gSvCanvas.getBoundingClientRect();
+                        let x = (e.clientX - rect.left) / rect.width;
+                        let y = (e.clientY - rect.top) / rect.height;
+                        x = Math.max(0, Math.min(1, x));
+                        y = Math.max(0, Math.min(1, y));
+                        gSat = x;
+                        gVal = 1 - y;
+                        updateGColor();
+                    };
+
+                    gSvCanvas.addEventListener("mousedown", (e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        gSvDragging = true;
+                        updateGSVFromEvent(e);
+                    });
+
+                    const updateGHueFromEvent = (e) => {
+                        const rect = gHueCanvas.getBoundingClientRect();
+                        let x = (e.clientX - rect.left) / rect.width;
+                        x = Math.max(0, Math.min(1, x));
+                        gHue = x * 360;
+                        drawGSV();
+                        updateGColor();
+                    };
+
+                    gHueCanvas.addEventListener("mousedown", (e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        gHueDragging = true;
+                        updateGHueFromEvent(e);
+                    });
+
+                    const gMoveHandler = (e) => {
+                        if (gSvDragging) updateGSVFromEvent(e);
+                        if (gHueDragging) updateGHueFromEvent(e);
+                    };
+                    const gUpHandler = () => { gSvDragging = false; gHueDragging = false; };
+                    document.addEventListener("mousemove", gMoveHandler);
+                    document.addEventListener("mouseup", gUpHandler);
+
+                    requestAnimationFrame(() => {
+                        const r = picker.getBoundingClientRect();
+                        if (r.right > window.innerWidth) {
+                            picker.style.left = (window.innerWidth - r.width - 10) + "px";
+                        }
+                        if (r.bottom > window.innerHeight) {
+                            picker.style.top = (rect.top - r.height - 4) + "px";
+                        }
+                    });
+
+                    const closeHandler = (e) => {
+                        if (picker.contains(e.target) || e.target === glowColorBtn) return;
+                        picker.remove();
+                        document.removeEventListener("mousedown", closeHandler, true);
+                        document.removeEventListener("mousemove", gMoveHandler);
+                        document.removeEventListener("mouseup", gUpHandler);
+                    };
+                    setTimeout(() => { document.addEventListener("mousedown", closeHandler, true); }, 100);
+                };
+
+                const updateRainbowEnabled = (enabled) => {
+                    p.rainbowEnabled = enabled;
+                    rainbowToggle._update(enabled);
+                    rainbowControlsWrap.style.display = enabled ? 'flex' : 'none';
+                    refreshTextareaVisuals();
+                    if (!enabled) checkAutoCollapseAdvanced();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateRainbowSpeed = (speed) => {
+                    const s = parseFloat(speed) ?? 30;
+                    p.rainbowSpeed = s;
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateBgEnabled = (enabled) => {
+                    p.bgEnabled = enabled;
+                    bgToggle._update(enabled);
+                    bgControlsWrap.style.display = enabled ? 'flex' : 'none';
+                    refreshTextareaVisuals();
+                    if (!enabled) checkAutoCollapseAdvanced();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateBgOpacity = (opacity) => {
+                    p.bgOpacity = opacity;
+                    refreshTextareaVisuals();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateBgRadius = (radius) => {
+                    p.borderRadius = parseInt(radius);
+                    const sc = getNodeViewportRect(node)?.scale || 1;
+                    ta.style.borderRadius = (parseInt(radius) * sc) + "px";
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                const updateBgPadding = (padding) => {
+                    p.bgPadding = parseInt(padding);
+                    const nr = getNodeViewportRect(node);
+                    if (nr) ta.style.padding = calcTitlePad(p, nr.scale) + "px 0";
+                    node.adjustHeightToContent();
+                    if (node.graph) node.graph.setDirtyCanvas(true, true);
+                };
+
+                glowToggle.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    updateGlowEnabled(!p.glowEnabled);
+                });
+                glowToggle.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+
+                glowSizeSlider.addEventListener("input", (e) => {
+                    updateGlowSize(e.target.value);
+                });
+                glowSizeSlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                glowSizeSlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                glowIntensitySlider.addEventListener("input", (e) => {
+                    updateGlowIntensity(e.target.value);
+                });
+                glowIntensitySlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                glowIntensitySlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                rainbowToggle.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    updateRainbowEnabled(!p.rainbowEnabled);
+                });
+                rainbowToggle.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+
+                rainbowSpeedSlider.addEventListener("input", (e) => {
+                    updateRainbowSpeed(e.target.value);
+                });
+                rainbowSpeedSlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                rainbowSpeedSlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                bgToggle.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    updateBgEnabled(!p.bgEnabled);
+                });
+                bgToggle.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+
+                bgOpacitySlider.addEventListener("input", (e) => {
+                    updateBgOpacity(e.target.value / 100);
+                });
+                bgOpacitySlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                bgOpacitySlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                bgRadiusSlider.addEventListener("input", (e) => {
+                    updateBgRadius(e.target.value);
+                });
+                bgRadiusSlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                bgRadiusSlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                bgPaddingSlider.addEventListener("input", (e) => {
+                    updateBgPadding(e.target.value);
+                });
+                bgPaddingSlider.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+                bgPaddingSlider.addEventListener("click", (e) => { e.stopPropagation(); });
+
+                advancedToggle.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    node._skipBlurClose = true;
+                    advancedWrap.style.display = 'flex';
+                    advancedRow.style.display = 'none';
+                    advancedToggle._update(true);
+                });
+                advancedToggle.addEventListener("mousedown", (e) => { e.stopPropagation(); });
+
+                ta.addEventListener("input", () => {
+                    node._userText = ta.value;
+                    p.text = ta.value;
+                    node.adjustHeightToContent();
+                    const vr2 = getNodeViewportRect(node);
+                    if (vr2) {
+                        container.style.left = vr2.left + "px";
+                        container.style.top = vr2.top + "px";
+                        container.style.width = Math.max(50, node.size[0] * vr2.scale) + "px";
+                        ta.style.height = Math.max(18, node.size[1] * vr2.scale) + "px";
+                        ta.style.padding = calcTitlePad(p, vr2.scale) + "px 0";
+                    }
+                    node.setDirtyCanvas?.(true, true);
+                    window.app?.graph?.setDirtyCanvas(true);
+                });
+                ta.addEventListener("compositionstart", () => { node._composing = true; });
+                ta.addEventListener("compositionend", () => { node._composing = false; });
+
+                ta.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); }, false);
+                ta.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    else if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); saveClose(); }
+                    e.stopPropagation();
+                });
+                
+                ta.addEventListener("wheel", (e) => {
+                    const canvas = app.canvas?.canvas;
+                    if (!canvas) return;
+                    e.stopPropagation();
+                    canvas.dispatchEvent(new WheelEvent('wheel', {
+                        deltaY: e.deltaY, deltaX: e.deltaX,
+                        clientX: e.clientX, clientY: e.clientY,
+                        ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey,
+                        bubbles: true, cancelable: true
+                    }));
+                }, { passive: false });
+                
+                slider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                
+                lineHeightSlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                
+                letterSpacingSlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                
+                fontSizeInput.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                
+                alignLeft.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                alignCenter.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                alignRight.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+
+                glowToggle.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                glowSizeSlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                glowIntensitySlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                rainbowToggle.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                rainbowSpeedSlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                bgToggle.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                bgOpacitySlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                bgRadiusSlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                bgPaddingSlider.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                advancedToggle.addEventListener("keydown", e => {
+                    if (e.key === "Escape") removeTitleEditor(node);
+                    e.stopPropagation();
+                });
+                // 追踪鼠标按下是否在面板内（拖拽超出面板不关闭）
+                node._mouseDownInEditor = false;
+                node._docMouseDown = e => {
+                    if (!node.isEditing || !node.editTextarea) return;
+                    let el = e.target;
+                    node._mouseDownInEditor = false;
+                    while (el) {
+                        if (el === container || el === toolbar) { node._mouseDownInEditor = true; break; }
+                        if (el.id === "rui-glow-color-picker") { node._mouseDownInEditor = true; break; }
+                        if (el.classList && (el.classList.contains("rui-wf-dialog-overlay") || el.classList.contains("rui-dialog-overlay"))) { node._mouseDownInEditor = true; break; }
+                        el = el.parentElement;
+                    }
+                };
+                // 点击画布空白处关闭面板
+                node._docClickHandler = e => {
+                    if (!node.isEditing || !node.editTextarea) return;
+                    if (node._mouseDownInEditor) { node._mouseDownInEditor = false; return; }
+                    let el = e.target;
+                    while (el) {
+                        if (el === container || el === toolbar) return;
+                        if (el.id === "rui-glow-color-picker") return;
+                        if (el.classList && (el.classList.contains("rui-wf-dialog-overlay") || el.classList.contains("rui-dialog-overlay"))) return;
+                        el = el.parentElement;
+                    }
+                    if (node._blurTimer) { clearTimeout(node._blurTimer); node._blurTimer = null; }
+                    saveClose();
+                };
+                setTimeout(() => { if (node.isEditing) document.addEventListener("click", node._docClickHandler, true); }, 200);
+                setTimeout(() => { if (node.isEditing) document.addEventListener("mousedown", node._docMouseDown, true); }, 200);
+
+                const isFocusInside = () => {
+                    const ae = document.activeElement;
+                    if (colorPanel.contains(ae)) return true;
+                    const glowPicker = document.getElementById("rui-glow-color-picker");
+                    if (glowPicker && glowPicker.contains(ae)) return true;
+                    if (advancedWrap.contains(ae) || bgRow.contains(ae) || row4.contains(ae) || row5.contains(ae)) return true;
+                    return ae === ta || ae === slider || ae === letterSpacingSlider || ae === lineHeightSlider || ae === fontSizeInput || ae === alignLeft || ae === alignCenter || ae === alignRight || ae === glowToggle || ae === glowSizeSlider || ae === glowIntensitySlider || ae === glowColorBtn || ae === rainbowToggle || ae === rainbowSpeedSlider || ae === bgToggle || ae === bgOpacitySlider || ae === bgRadiusSlider || ae === advancedToggle;
+                };
+
+                ta.addEventListener("blur", () => { setTimeout(() => {
+                    if (!node.isEditing || isFocusInside()) return;
+                    if (node._skipBlurClose) { node._skipBlurClose = false; return; }
+                    const ae = document.activeElement;
+                    if (ae && vueSels(node.id).some(sel => ae.closest?.(sel))) {
+                        if ((node._blurRetries = (node._blurRetries || 0) + 1) <= 4) { ta.focus({ preventScroll: true }); }
+                        return;
+                    }
+                    saveClose();
+                }, 150); });
+                
+                slider.addEventListener("blur", () => { setTimeout(() => {
+                    if (!node.isEditing || isFocusInside()) return;
+                    const ae = document.activeElement;
+                    if (ae && vueSels(node.id).some(sel => ae.closest?.(sel))) {
+                        return;
+                    }
+                    saveClose();
+                }, 150); });
+                
+                lineHeightSlider.addEventListener("blur", () => { setTimeout(() => {
+                    if (!node.isEditing || isFocusInside()) return;
+                    const ae = document.activeElement;
+                    if (ae && vueSels(node.id).some(sel => ae.closest?.(sel))) {
+                        return;
+                    }
+                    saveClose();
+                }, 150); });
+
+                letterSpacingSlider.addEventListener("blur", () => { setTimeout(() => {
+                    if (!node.isEditing || isFocusInside()) return;
+                    const ae = document.activeElement;
+                    if (ae && vueSels(node.id).some(sel => ae.closest?.(sel))) {
+                        return;
+                    }
+                    saveClose();
+                }, 150); });
+
+                fontSizeInput.addEventListener("blur", () => { setTimeout(() => {
+                    if (!node.isEditing || isFocusInside()) return;
+                    const ae = document.activeElement;
+                    if (ae && vueSels(node.id).some(sel => ae.closest?.(sel))) {
+                        return;
+                    }
+                    const val = parseFloat(fontSizeInput.value);
+                    if (!isNaN(val) && val >= 8 && val <= 300) {
+                        updateFontSize(val);
+                    } else {
+                        fontSizeInput.value = p.fontSize;
+                    }
+                    saveClose();
+                }, 150); });
+
+                node.isEditing = true;
+            }
+
+            function removeTitleEditor(node) {
+                if (node._focusGuard) { cancelAnimationFrame(node._focusGuard); node._focusGuard = null; }
+                if (node._posRaf) { cancelAnimationFrame(node._posRaf); node._posRaf = null; }
+                if (node._docClickHandler) { document.removeEventListener("click", node._docClickHandler, true); node._docClickHandler = null; }
+                if (node._docMouseDown) { document.removeEventListener("mousedown", node._docMouseDown, true); node._docMouseDown = null; }
+                
+                const glowPicker = document.getElementById("rui-glow-color-picker");
+                if (glowPicker) glowPicker.remove();
+                if (node.editTextarea) { node.editTextarea.remove(); node.editTextarea = null; }
+                delete node._userText;
+                node.isEditing = false;
+            }
+        }
+    },
+
+    /* ── 节点悬浮预览 ── */
+    _showNodePreview(item, nodeType) {
+        if (!nodeType) return;
+        this._hideNodePreview();
+        try {
+            const nodeData = this.favorites.nodes.find(n => n.type === nodeType);
+            const nodeName = nodeData?.displayName || nodeType;
+
+            // 获取节点注册信息
+            const nodeDef = LiteGraph.registered_node_types[nodeType];
+            const inputs = nodeDef?.prototype?.inputs || [];
+            const outputs = nodeDef?.prototype?.outputs || [];
+            const nodeColor = nodeDef?.color || "#555";
+
+            const previewEl = document.createElement("div");
+            this._previewEl = previewEl;
+            previewEl.style.cssText = `position:fixed;z-index:99999;left:${item.getBoundingClientRect().right + 12}px;top:${item.getBoundingClientRect().top}px;pointer-events:none;background:#1a1a1a;border:1px solid #444;border-radius:8px;padding:0;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.6);color:#ccc;font-family:Arial,sans-serif;font-size:11px;min-width:180px;`;
+
+            // 顶部标题
+            const header = document.createElement("div");
+            header.style.cssText = `padding:6px 10px;background:${nodeColor};color:#fff;font-weight:bold;font-size:12px;white-space:nowrap;`;
+            const title = nodeName.length > 20 ? nodeName.substring(0, 19) + "…" : nodeName;
+            header.textContent = title;
+            previewEl.appendChild(header);
+
+            // 端口信息
+            const body = document.createElement("div");
+            body.style.cssText = "padding:6px 10px;display:flex;gap:16px;";
+            const inList = document.createElement("div");
+            inList.style.cssText = "flex:1;min-width:0;";
+            const outList = document.createElement("div");
+            outList.style.cssText = "flex:1;min-width:0;text-align:right;";
+
+            const maxShow = 8;
+            for (let i = 0; i < Math.min(inputs.length, maxShow); i++) {
+                const row = document.createElement("div");
+                row.style.cssText = "padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+                row.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#666;margin-right:4px;vertical-align:middle;"></span>${(inputs[i].label || inputs[i].name || "input").substring(0, 14)}`;
+                inList.appendChild(row);
+            }
+            if (inputs.length > maxShow) {
+                const more = document.createElement("div");
+                more.style.cssText = "color:#888;padding:1px 0;";
+                more.textContent = `…+${inputs.length - maxShow} 个输入`;
+                inList.appendChild(more);
+            }
+
+            for (let i = 0; i < Math.min(outputs.length, maxShow); i++) {
+                const row = document.createElement("div");
+                row.style.cssText = "padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+                row.innerHTML = `${(outputs[i].label || outputs[i].name || "output").substring(0, 14)}<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#666;margin-left:4px;vertical-align:middle;"></span>`;
+                outList.appendChild(row);
+            }
+            if (outputs.length > maxShow) {
+                const more = document.createElement("div");
+                more.style.cssText = "color:#888;padding:1px 0;";
+                more.textContent = `…+${outputs.length - maxShow} 个输出`;
+                outList.appendChild(more);
+            }
+
+            body.appendChild(inList);
+            body.appendChild(outList);
+            previewEl.appendChild(body);
+
+            // 底栏
+            const footer = document.createElement("div");
+            footer.style.cssText = "padding:4px 10px;border-top:1px solid #333;display:flex;justify-content:space-between;color:#777;font-size:10px;";
+            footer.innerHTML = (nodeData?.useCount || 0) > 0 ? `<span>使用 ${nodeData.useCount} 次</span>` : "";
+            previewEl.appendChild(footer);
+
+            document.body.appendChild(previewEl);
+        } catch(e) {
+            console.warn("[Rui] 预览渲染失败:", e);
+        }
+    },
+
+    _hideNodePreview() {
+        if (this._previewEl) {
+            this._previewEl.remove();
+            this._previewEl = null;
+        }
+    },
+
+    setCustomWidgets(app) {
+    },
+
+    nodeCreated(node) {
+        this._translateNodeParams(node);
+    },
+
+    loadedGraphNode(node) {
+        this._translateNodeParams(node);
+    },
+
+    _translateNodeParams(node) {
+        if (node.comfyClass !== "RuiDuplicateFirstFrame" && node.type !== "RuiDuplicateFirstFrame") {
+            return;
+        }
+        const inputMap = {
+            "image": ruiT("图像", "image"),
+            "copy_count": ruiT("复制数量", "copy count"),
+        };
+        const outputMap = {
+            "image": ruiT("图像", "image"),
+            "frame_count": ruiT("实际帧数", "frame count"),
+            "first_frame": ruiT("首帧", "first frame"),
+            "last_frame": ruiT("尾帧", "last frame"),
+        };
+
+        if (node.inputs) {
+            for (const input of node.inputs) {
+                if (inputMap[input.name]) {
+                    input.localized_name = inputMap[input.name];
+                }
+            }
+        }
+        if (node.outputs) {
+            for (const output of node.outputs) {
+                if (outputMap[output.name]) {
+                    output.localized_name = outputMap[output.name];
+                }
+            }
+        }
+        if (node.widgets) {
+            for (const w of node.widgets) {
+                if (inputMap[w.name]) {
+                    w.label = inputMap[w.name];
+                }
+            }
+        }
+    }
+});

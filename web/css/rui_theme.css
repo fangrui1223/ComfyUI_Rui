@@ -1,0 +1,697 @@
+
+.rui-theme-panel {
+    position: fixed;
+    z-index: 99999;
+    width: 280px;
+    background: #2a2a2a;
+    border: 1px solid #444;
+    border-radius: 8px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    font-family: Arial, sans-serif;
+    font-size: 12px;
+    color: #ddd;
+    display: none;
+    overflow: hidden;
+}
+
+.rui-theme-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    background: #2a2a2a;
+    border-bottom: 1px solid #444;
+    color: #ddd;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+.rui-theme-title {
+    font-size: 13px;
+}
+
+.rui-top-tabs {
+    display: flex;
+    background: #222;
+    border-bottom: 1px solid #444;
+}
+
+.rui-top-tab {
+    flex: 1;
+    padding: 8px 12px;
+    background: transparent;
+    color: #888;
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+    transition: all 0.2s;
+    border-bottom: 2px solid transparent;
+}
+
+.rui-top-tab:hover {
+    color: #ddd;
+    background: #2a2a2a;
+}
+
+.rui-top-tab.active {
+    color: #222;
+    background: #FFD700;
+    border-bottom-color: #FFD700;
+    font-weight: bold;
+}
+
+.rui-tab-content {
+    width: 100%;
+}
+
+.rui-theme-close {
+    background: none;
+    border: none;
+    color: #999;
+    font-size: 18px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+    opacity: 0.8;
+    transition: opacity 0.2s;
+}
+
+.rui-theme-close:hover {
+    opacity: 1;
+}
+
+.rui-theme-header-btns {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    position: relative;
+}
+
+.rui-theme-config-btn,
+.rui-theme-shortcut-btn {
+    background: transparent !important;
+    color: #ddd !important;
+    border: 1px solid #555 !important;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+            .rui-theme-config-btn:hover,
+            .rui-theme-shortcut-btn:hover {
+                background: rgba(255, 255, 255, 0.1) !important;
+            }
+
+.rui-theme-content {
+    padding: 12px;
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+.rui-theme-section {
+    margin-bottom: 12px;
+}
+
+.rui-theme-section:last-child {
+    margin-bottom: 0;
+}
+
+.rui-theme-section-title {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 8px;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.rui-theme-preview {
+    width: 100%;
+    height: 40px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 12px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.rui-preview-text {
+    font-size: 12px;
+    font-weight: bold;
+    color: #fff;
+}
+
+.rui-theme-color-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.rui-theme-label {
+    font-size: 12px;
+    color: #aaa;
+    min-width: 60px;
+}
+
+.rui-theme-color-row input[type="color"] {
+    width: 50px;
+    height: 28px;
+    border: 1px solid #555;
+    border-radius: 4px;
+    cursor: pointer;
+    background: #333;
+    padding: 0;
+}
+
+.rui-theme-direction-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+    margin-top: 10px;
+}
+
+.rui-direction-buttons {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+}
+
+.rui-dir-btn {
+    width: 28px;
+    height: 28px;
+    border: 1px solid #555;
+    border-radius: 4px;
+    background: #333;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.rui-dir-btn:hover {
+    background: #444;
+    color: #fff;
+}
+
+.rui-dir-btn.active {
+    background: #667eea;
+    border-color: #667eea;
+    color: #fff;
+}
+
+.rui-theme-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 12px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid #444;
+}
+
+.rui-switch {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+}
+
+.rui-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.rui-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #555;
+    transition: 0.3s;
+    border-radius: 22px;
+}
+
+.rui-slider:before {
+    position: absolute;
+    content: "";
+    height: 16px;
+    width: 16px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: 0.3s;
+    border-radius: 50%;
+}
+
+.rui-switch input:checked + .rui-slider {
+    background-color: #667eea;
+}
+
+.rui-switch input:checked + .rui-slider:before {
+    transform: translateX(18px);
+}
+
+.rui-theme-separator {
+    height: 1px;
+    background: #444;
+    margin: 12px 0;
+}
+
+.rui-theme-font-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.rui-font-size-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.rui-font-btn {
+    width: 28px;
+    height: 28px;
+    border: 1px solid #555;
+    border-radius: 4px;
+    background: #333;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.rui-font-btn:hover {
+    background: #444;
+    color: #fff;
+}
+
+.rui-font-btn:active {
+    transform: scale(0.95);
+}
+
+.rui-font-size-value {
+    min-width: 30px;
+    text-align: center;
+    font-size: 12px;
+    color: #ccc;
+}
+
+.rui-align-buttons {
+    display: flex;
+    gap: 4px;
+}
+
+.rui-align-btn {
+    width: 36px;
+    height: 28px;
+    border: 1px solid #555;
+    border-radius: 4px;
+    background: #333;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.rui-align-btn:hover {
+    background: #444;
+    color: #fff;
+}
+
+.rui-align-btn.active {
+    background: #667eea;
+    border-color: #667eea;
+    color: #fff;
+}
+
+.rui-apply-btn {
+    width: 100%;
+    padding: 10px 16px;
+    background: #333;
+    color: #ddd;
+    border: 1px solid #555;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: bold;
+    transition: opacity 0.2s;
+    margin-top: 4px;
+}
+
+.rui-apply-btn:hover {
+    opacity: 0.9;
+}
+
+.rui-reset-btn {
+    width: 100%;
+    padding: 8px 16px;
+    background: #444;
+    color: #ccc;
+    border: 1px solid #555;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: all 0.2s;
+    margin-top: 6px;
+}
+
+.rui-reset-btn:hover {
+    background: #555;
+    color: #fff;
+}
+
+.rui-theme-content::-webkit-scrollbar {
+    width: 6px;
+}
+
+.rui-theme-content::-webkit-scrollbar-track {
+    background: #222;
+}
+
+.rui-theme-content::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 3px;
+}
+
+.rui-theme-content::-webkit-scrollbar-thumb:hover {
+    background: #666;
+}
+
+.rui-menu-hide-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.rui-menu-hide-controls {
+    margin-top: 8px;
+}
+
+.rui-menu-hide-tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 6px;
+}
+
+.rui-menu-tab {
+    flex: 1;
+    padding: 5px 4px;
+    background: #333;
+    color: #aaa;
+    border: 1px solid #444;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    transition: all 0.2s;
+}
+
+.rui-menu-tab:hover {
+    background: #3a3a3a;
+    color: #ddd;
+}
+
+.rui-menu-tab.active {
+    background: #4a4a4a;
+    color: #FFD700;
+    border-color: #FFD700;
+}
+
+.rui-menu-search-box {
+    position: relative;
+    margin-bottom: 8px;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+#rui-menu-search-input {
+    width: 100%;
+    padding: 6px 28px 6px 10px;
+    background: #1a1a1a;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #ddd;
+    font-size: 12px;
+    box-sizing: border-box;
+    outline: none;
+    transition: border-color 0.2s;
+    display: block;
+}
+
+#rui-menu-search-input:focus {
+    border-color: #FFD700;
+    box-shadow: 0 0 4px rgba(255, 215, 0, 0.3);
+}
+
+.rui-menu-search-clear {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+}
+
+.rui-menu-search-clear:hover {
+    background: #444;
+    color: #fff;
+}
+
+.rui-menu-hide-toolbar {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 6px;
+}
+
+.rui-menu-tool-btn {
+    flex: 1;
+    padding: 4px 6px;
+    background: #333;
+    color: #aaa;
+    border: 1px solid #444;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    transition: all 0.2s;
+}
+
+.rui-menu-tool-btn:hover {
+    background: #3a3a3a;
+    color: #fff;
+}
+
+.rui-menu-hide-list {
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 4px;
+    background: #1a1a1a;
+}
+
+.rui-menu-hide-full {
+    padding: 10px 12px;
+}
+
+.rui-menu-empty-tip {
+    text-align: center;
+    color: #888;
+    font-size: 11px;
+    padding: 20px 8px;
+    line-height: 1.6;
+}
+
+.rui-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 12px;
+    color: #ccc;
+    transition: background 0.15s;
+}
+
+.rui-menu-item:hover {
+    background: #2a2a2a;
+}
+
+.rui-menu-item input[type="checkbox"] {
+    cursor: pointer;
+    accent-color: #FFD700;
+}
+
+.rui-menu-item span {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.rui-menu-reset-btn {
+    width: 100%;
+    padding: 6px 12px;
+    background: #444;
+    color: #aaa;
+    border: 1px solid #555;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    transition: all 0.2s;
+    margin-top: 8px;
+}
+
+.rui-menu-reset-btn:hover {
+    background: #555;
+    color: #fff;
+}
+
+.rui-menu-hide-list::-webkit-scrollbar {
+    width: 5px;
+}
+
+.rui-menu-hide-list::-webkit-scrollbar-track {
+    background: #1a1a1a;
+}
+
+.rui-menu-hide-list::-webkit-scrollbar-thumb {
+    background: #444;
+    border-radius: 2px;
+}
+
+.rui-menu-hide-list::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}
+
+.rui-quick-nodes-count {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 8px;
+}
+
+.rui-quick-nodes-count span {
+    color: #FFD700;
+    font-weight: bold;
+}
+
+.rui-quick-node-manage-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    border-bottom: 1px solid #333;
+    cursor: move;
+    transition: background 0.15s;
+    font-size: 12px;
+}
+
+.rui-quick-node-manage-item:last-child {
+    border-bottom: none;
+}
+
+.rui-quick-node-manage-item:hover {
+    background: #2a2a2a;
+}
+
+.rui-quick-node-manage-item.dragging {
+    opacity: 0.5;
+    background: #333;
+}
+
+.rui-quick-node-manage-item.drag-over {
+    border-top: 2px solid #FFD700;
+}
+
+.rui-quick-drag-handle {
+    color: #666;
+    font-size: 12px;
+    cursor: move;
+    flex-shrink: 0;
+    line-height: 1;
+    user-select: none;
+}
+
+.rui-quick-node-info {
+    flex: 1;
+    overflow: hidden;
+    min-width: 0;
+}
+
+.rui-quick-node-name {
+    font-size: 12px;
+    color: #ddd;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: 1.3;
+}
+
+.rui-quick-node-type {
+    font-size: 10px;
+    color: #888;
+    margin-top: 1px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.rui-quick-node-remove-btn {
+    background: none;
+    border: 1px solid #555;
+    color: #999;
+    padding: 2px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 12px;
+    flex-shrink: 0;
+    transition: all 0.15s;
+}
+
+    .rui-quick-node-remove-btn:hover {
+        background: rgba(255, 255, 255, 0.1);
+    }
+
+.rui-quick-setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 0;
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: #ddd;
+}

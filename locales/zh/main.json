@@ -1,0 +1,14 @@
+{
+  "nodeCategories": {
+    "Rui": "Rui",
+    "Rui/Image": "图像",
+    "Rui/Image/Load": "加载",
+    "Rui/Image/Save": "保存",
+    "Rui/Image/Preview": "预览",
+    "Rui/Batch": "批处理",
+    "Rui/Flow": "流程",
+    "Rui/Logic": "逻辑",
+    "Rui/UI": "界面工具",
+    "Rui/Utilities": "实用工具"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "RuiDirectorySync": {"display_name":"Rui 双目录同步遍历","inputs":{"dir_A":{"name":"A区目录"},"dir_B":{"name":"B区目录"},"global_index":{"name":"当前编号"}},"outputs":{"0":{"name":"A区图片路径"},"1":{"name":"B区图片路径"}}},
+  "RuiImageLoader": {"display_name":"Rui 路径图像加载器","inputs":{"image":{"name":"图像"},"image_path":{"name":"图像路径"}},"outputs":{"0":{"name":"图像"},"1":{"name":"遮罩"},"2":{"name":"文件名"}}},
+  "RuiImageSaver": {"display_name":"Rui 图像保存器","inputs":{"images":{"name":"图像"},"image_path_A":{"name":"源图像路径"},"dir_C":{"name":"保存目录"},"save_format":{"name":"保存格式"},"quality":{"name":"质量"},"copy_to_comfy_output":{"name":"复制到 ComfyUI 输出"}}},
+  "RuiDirectorySkip": {"display_name":"Rui 文件夹遍历","inputs":{"dir_ZD":{"name":"文件夹"},"global_index":{"name":"当前编号"},"skip_last_n":{"name":"忽略末尾张数"}},"outputs":{"0":{"name":"图片路径"}}},
+  "RuiDirectoryTail": {"display_name":"Rui 文件夹尾图遍历","inputs":{"dir_ZD":{"name":"文件夹"},"global_index":{"name":"当前编号"},"tail_n":{"name":"读取末尾张数"}},"outputs":{"0":{"name":"图片路径"}}},
+  "RuiFlatImageReader": {"display_name":"Rui 当前目录图片遍历","inputs":{"dir_ZD":{"name":"文件夹"},"global_index":{"name":"当前编号"},"image_format":{"name":"图片格式","options":{"all":"全部"}},"skip_last_n":{"name":"忽略末尾张数"}},"outputs":{"0":{"name":"图片路径"}}},
+  "RuiImageCount": {"display_name":"Rui 图片数量统计","inputs":{"dir_ZD":{"name":"文件夹"},"image_format":{"name":"图片格式","options":{"all":"全部"}}},"outputs":{"0":{"name":"图片数量"}}},
+  "RuiUniversalImageSaver": {"display_name":"Rui 通用图像保存器","inputs":{"images":{"name":"图像"},"save_dir":{"name":"保存根目录"},"folder_name":{"name":"子文件夹名"},"save_name":{"name":"文件名"},"save_format":{"name":"保存格式"},"quality":{"name":"质量"},"copy_to_comfy_output":{"name":"复制到 ComfyUI 输出"}}},
+  "RuiPlaySound": {"display_name":"Rui 播放声音","inputs":{"any_input":{"name":"任意输入"},"mode":{"name":"模式","options":{"always":"始终播放","disabled":"禁用"}},"sound_type":{"name":"声音"}}},
+  "RuiGroupSwitchIndex": {"display_name":"Rui 忽略组的选择","inputs":{"selected_index_value":{"name":"当前选择编号"}},"outputs":{"0":{"name":"当前选择编号"}}},
+  "RuiLightForStart": {"display_name":"Rui 轻量循环开始","inputs":{"total":{"name":"总次数"},"start_index":{"name":"开始编号"}},"outputs":{"0":{"name":"循环控制"},"1":{"name":"当前编号"},"2":{"name":"总次数"}}},
+  "RuiLightForEnd": {"display_name":"Rui 轻量循环结束","inputs":{"flow":{"name":"循环控制"},"index":{"name":"当前编号"},"total":{"name":"总次数"},"loop_done":{"name":"本轮完成依赖"}},"outputs":{"0":{"name":"最终编号"},"1":{"name":"总次数"}}},
+  "RuiImageUploadLoader": {"display_name":"Rui 图像加载器","inputs":{"image_list":{"name":"图像列表"},"index":{"name":"当前编号"},"batch_mode":{"name":"批次模式"},"mask_data":{"name":"遮罩数据"},"upload_mode":{"name":"上传模式"},"source_names":{"name":"原始文件名列表"}},"outputs":{"0":{"name":"图像"},"1":{"name":"遮罩"},"2":{"name":"原始文件名"},"3":{"name":"不含后缀文件名"}}},
+  "RuiImageCompare": {"display_name":"Rui 图像对比","inputs":{"a":{"name":"图像 A"},"b":{"name":"图像 B"},"reduce_lag":{"name":"减少卡顿"},"show_line":{"name":"显示分隔线"}}},
+  "RuiResizeAndPadImage": {"display_name":"Rui 调整图像尺寸填充","inputs":{"input_image":{"name":"输入图像"},"target_size":{"name":"最长边目标尺寸"},"resolution_multiple":{"name":"对齐倍数"},"padding_strategy":{"name":"填充策略","options":{"nearest_ratio":"就近常用比例","minimal_padding":"最小对齐填充"}},"upscale_method":{"name":"缩放算法"},"resize_and_pad":{"name":"调整并填充"}},"outputs":{"0":{"name":"输出图像"},"1":{"name":"图像信息"},"2":{"name":"画布宽"},"3":{"name":"画布高"}}},
+  "RuiRemoveImagePadding": {"display_name":"Rui 移除图像填充","inputs":{"input_image":{"name":"输入图像"},"image_info":{"name":"图像信息"},"remove_pad":{"name":"移除填充"}},"outputs":{"0":{"name":"输出图像"}}},
+  "RuiUniversalSlider": {"display_name":"Rui 万能滑条","inputs":{"value":{"name":"数值"},"output_type":{"name":"输出类型"}},"outputs":{"0":{"name":"输出"}}},
+  "RuiSelector": {"display_name":"Rui 选择器","inputs":{"label":{"name":"当前标签"},"_rui_settings":{"name":"设置"}},"outputs":{"0":{"name":"数值"}}},
+  "RuiTitle": {"display_name":"Rui 注释与标题"},
+  "RuiText": {"display_name":"Rui 文本","inputs":{"text":{"name":"文本"}},"outputs":{"0":{"name":"文本"},"1":{"name":"显示帮助"}}},
+  "RuiIntToBoolean": {"display_name":"Rui 整数转布尔","inputs":{"value":{"name":"整数"},"invert":{"name":"反转"}},"outputs":{"0":{"name":"布尔"}}}
+}
