@@ -1,3 +1,4 @@
+import { app } from "../../../scripts/app.js";
 
 import { ruiT } from "./rui_i18n.js";
 
@@ -6,7 +7,8 @@ window.RUIThemeManager = {
     styleElement: null,
     panelStyleElement: null,
     canvasHooked: false,
-    protoRefs: {},
+    domObserver: null,
+    domGradientFrame: null,
     linkHighlightActive: false,
     linkHighlightHooked: false,
     linkLaserActive: false,
@@ -111,7 +113,6 @@ window.RUIThemeManager = {
         this.injectPanelStyles();
         this.setupContextMenu();
         this.ensureCanvasHook();
-        this.hookSerialize();
         this._initWallpaperDB();
         this.initWallpaper();
     },
@@ -1277,58 +1278,6 @@ window.RUIThemeManager = {
         document.head.appendChild(this.panelStyleElement);
     },
 
-    _serializeHooksInstalled: false,
-
-    hookSerialize(retryCount = 0) {
-        // 如果已安装则跳过
-        if (this._serializeHooksInstalled) return;
-
-        const self = this;
-        
-        function hookProto(proto, name, makeWrapper) {
-            const orig = proto[name];
-            if (orig && orig._ruiWrapped) return;
-            const wrapped = makeWrapper(orig);
-            wrapped._ruiWrapped = true;
-            self.protoRefs[name] = orig;
-            proto[name] = wrapped;
-        }
-
-        if (window.LiteGraph && LiteGraph.LGraphNode && LiteGraph.LGraphNode.prototype) {
-            hookProto(LiteGraph.LGraphNode.prototype, 'serialize', (orig) => function() {
-                const data = orig ? orig.call(this) : {};
-                if (this._ruiGradient) {
-                    data._ruiGradient = JSON.parse(JSON.stringify(this._ruiGradient));
-                }
-                return data;
-            });
-
-            hookProto(LiteGraph.LGraphNode.prototype, 'configure', (orig) => function(data) {
-                if (orig) orig.call(this, data);
-                if (data && data._ruiGradient) {
-                    this._ruiGradient = JSON.parse(JSON.stringify(data._ruiGradient));
-                }
-            });
-
-            hookProto(LiteGraph.LGraphNode.prototype, 'onAdded', (orig) => function(graph) {
-                if (orig) orig.call(this, graph);
-                if (this._ruiGradient) {
-                    setTimeout(() => {
-                        RUIThemeManager.applyGradientToDOMNode(this);
-                    }, 50);
-                }
-            });
-
-            this._serializeHooksInstalled = true;
-            console.log('[Rui主题] 序列化 Hook 已安装 ✓');
-        } else if (retryCount < 60) {
-            // LiteGraph 尚未就绪，延迟重试（最多60次=6秒）
-            setTimeout(() => self.hookSerialize(retryCount + 1), 100);
-        } else {
-            console.warn('[Rui主题] 序列化 Hook 安装失败：LiteGraph 超时未就绪');
-        }
-    },
-
     ensureCanvasHook() {
         if (this.canvasHooked) return;
         if (!window.app || !app.canvas) {
@@ -1338,6 +1287,11 @@ window.RUIThemeManager = {
         this.hookDrawNodeShape();
         this.setupLinkHighlight();
         this.hookTitleEditDialog();
+        const container = document.getElementById("graph-canvas-container");
+        if (container) {
+            this.domObserver = new MutationObserver(() => this.scheduleDOMGradients());
+            this.domObserver.observe(container, { childList: true, subtree: true });
+        }
         this.canvasHooked = true;
     },
 
@@ -1370,9 +1324,9 @@ window.RUIThemeManager = {
                     if (ids.length === 1) node = sel[ids[0]];
                 }
             }
-            if (!node || !node._ruiGradient) return;
+            if (!node || !node.properties?.rui_theme) return;
 
-            const cfg = node._ruiGradient;
+            const cfg = node.properties?.rui_theme;
             const fontFamily = '"Microsoft YaHei","微软雅黑","PingFang SC","Hiragino Sans GB","SimHei",Arial,sans-serif';
             const align = cfg.textAlign || 'left';
             const LG = typeof LiteGraph !== 'undefined' ? LiteGraph : null;
@@ -2877,7 +2831,7 @@ window.RUIThemeManager = {
                     return;
                 }
 
-                if (!node._ruiGradient) {
+                if (!node.properties?.rui_theme) {
                     origFn.call(this, node, ctx, size, fgcolor, bgcolor, selected, mouseOver);
                     return;
                 }
@@ -2886,7 +2840,7 @@ window.RUIThemeManager = {
                 const th = LG?.NODE_TITLE_HEIGHT || 30;
                 const w = size[0], h = size[1];
                 const r = node.borderRadius || LG?.NODE_CORNER_RADIUS || 8;
-                const cfg = node._ruiGradient;
+                const cfg = node.properties?.rui_theme;
                 const pts = self._gradPts(w, h, th);
                 const titlePts = self._titleGradPts(w, th);
                 const bodyPts = self._bodyGradPts(w, h);
@@ -3082,11 +3036,11 @@ window.RUIThemeManager = {
         if (!nodes || !nodes.length) return;
         
         const cfg = this.buildGradientConfig(colors);
-        const gradCSS = this.buildGradientCSS(colors);
 
+        // 新前端可能从 store 序列化工作流，主题需要放在标准 properties 中。
         nodes.forEach(node => {
             if (node.type === "RuiTitle") return;
-            node._ruiGradient = { ...cfg };
+            node.properties.rui_theme = JSON.parse(JSON.stringify(cfg));
             node.color = colors.color1;
             node.bgcolor = colors.color1;
             this.applyGradientToDOMNode(node);
@@ -3100,12 +3054,12 @@ window.RUIThemeManager = {
     },
 
     applyGradientToDOMNode(node) {
-        if (!node || !node._ruiGradient) return;
+        if (!node || !node.properties?.rui_theme) return;
         
-        const graphCanvas = document.getElementById("graph-canvas");
+        const graphCanvas = document.getElementById("graph-canvas-container");
         if (!graphCanvas) return;
 
-        const cfg = node._ruiGradient;
+        const cfg = node.properties?.rui_theme;
         const useTitleGradient = cfg.useTitleGradient && cfg.titleStops && cfg.titleStops.length > 0;
         
         const gradCSS = this.buildGradientCSS({
@@ -3129,17 +3083,12 @@ window.RUIThemeManager = {
         );
         
         nodeEls.forEach(nodeEl => {
-            const inner = nodeEl.querySelector('[data-testid="node-inner-wrapper"]') || nodeEl;
+            const inner = nodeEl.querySelector('[data-testid="node-inner-wrapper"]');
+            if (!inner) return;
             
-            if (useTitleGradient) {
-                inner.style.setProperty('background', gradCSS, 'important');
-                inner.style.setProperty('--component-node-background', 'transparent', 'important');
-                inner.style.setProperty('--component-node-header', 'transparent', 'important');
-            } else {
-                inner.style.setProperty('background', gradCSS, 'important');
-                inner.style.setProperty('--component-node-background', 'transparent', 'important');
-                inner.style.setProperty('--component-node-header', 'transparent', 'important');
-            }
+            inner.style.setProperty('background', gradCSS, 'important');
+            inner.style.setProperty('--component-node-background', 'transparent', 'important');
+            inner.style.setProperty('--component-node-header', 'transparent', 'important');
 
             const headerSelectors = [
                 '[data-testid*="header"]', '.comfy-header', '.comfy-title', 
@@ -3150,7 +3099,6 @@ window.RUIThemeManager = {
             if (header) {
                 if (useTitleGradient && titleGradCSS) {
                     header.style.setProperty('background', titleGradCSS, 'important');
-                    header.style.setProperty('background-color', titleGradCSS, 'important');
                 } else {
                     header.style.setProperty('background', 'transparent', 'important');
                     header.style.setProperty('background-color', 'transparent', 'important');
@@ -3190,6 +3138,7 @@ window.RUIThemeManager = {
         if (!nodes || !nodes.length) return;
 
         nodes.forEach(node => {
+            delete node.properties.rui_theme;
             delete node._ruiGradient;
             node.color = null;
             node.bgcolor = null;
@@ -3203,7 +3152,7 @@ window.RUIThemeManager = {
     },
 
     removeGradientFromDOMNode(node) {
-        const graphCanvas = document.getElementById("graph-canvas");
+        const graphCanvas = document.getElementById("graph-canvas-container");
         if (!graphCanvas) return;
 
         const nodeEls = graphCanvas.querySelectorAll(
@@ -3211,17 +3160,16 @@ window.RUIThemeManager = {
         );
         
         nodeEls.forEach(nodeEl => {
-            const inner = nodeEl.querySelector('[data-testid="node-inner-wrapper"]') || nodeEl;
+            const inner = nodeEl.querySelector('[data-testid="node-inner-wrapper"]');
+            if (!inner) return;
             inner.style.removeProperty('background');
             inner.style.removeProperty('background-color');
             inner.style.removeProperty('--component-node-background');
             inner.style.removeProperty('--component-node-header');
 
-            const allChilds = nodeEl.querySelectorAll('*');
-            allChilds.forEach(child => {
-                child.style.removeProperty('background');
-                child.style.removeProperty('background-color');
-            });
+            const body = nodeEl.querySelector('[data-testid*="body"], .comfy-body, .comfy-content, .node-body, .content');
+            body?.style.removeProperty('background');
+            body?.style.removeProperty('background-color');
 
             const headerSelectors = [
                 '[data-testid*="header"]', '.comfy-header', '.comfy-title', 
@@ -3230,6 +3178,8 @@ window.RUIThemeManager = {
             ];
             const header = nodeEl.querySelector(headerSelectors.join(', '));
             if (header) {
+                header.style.removeProperty('background');
+                header.style.removeProperty('background-color');
                 header.style.removeProperty('color');
                 header.style.removeProperty('font-size');
                 header.style.removeProperty('text-align');
@@ -3277,8 +3227,8 @@ window.RUIThemeManager = {
     },
 
     getNodeGradient(node) {
-        if (!node || !node._ruiGradient) return null;
-        const cfg = node._ruiGradient;
+        if (!node || !node.properties?.rui_theme) return null;
+        const cfg = node.properties?.rui_theme;
         const useTitleGradient = cfg.useTitleGradient && cfg.titleStops && cfg.titleStops.length > 0;
         return {
             color1: cfg.stops[0]?.color || '#e65c5c',
@@ -3392,18 +3342,6 @@ window.RUIThemeManager = {
 
         this.setupSelectionListener();
         this.setupCanvasContextMenu();
-
-        const observer = new MutationObserver(() => {
-            self.refreshDOMGradients();
-        });
-        
-        const graphCanvas = document.getElementById("graph-canvas");
-        if (graphCanvas) {
-            observer.observe(graphCanvas, { 
-                childList: true, 
-                subtree: true 
-            });
-        }
     },
 
     setupCanvasContextMenu() {
@@ -3511,12 +3449,20 @@ window.RUIThemeManager = {
         }
     },
 
+    scheduleDOMGradients() {
+        if (this.domGradientFrame) return;
+        this.domGradientFrame = requestAnimationFrame(() => {
+            this.domGradientFrame = null;
+            this.refreshDOMGradients();
+        });
+    },
+
     refreshDOMGradients() {
         if (!window.app || !app.graph) return;
         const nodes = app.graph._nodes || app.graph.nodes;
         if (!nodes) return;
         nodes.forEach(node => {
-            if (node._ruiGradient) {
+            if (node.properties?.rui_theme) {
                 this.applyGradientToDOMNode(node);
             }
         });
@@ -4170,59 +4116,70 @@ window.RUIThemeManager = {
     }
 })();
 
-(function registerExtensionEarly() {
-    function tryRegister() {
-        if (window.app && typeof window.app.registerExtension === "function") {
-            try {
-                app.registerExtension({
-                    name: "RUI.Theme",
-                    
-                    getNodeMenuItems(node) {
-                        if (!window.RUIThemeManager) return [];
-                        
-                        const canvas = app.canvas;
-                        let nodes = [];
-                        if (canvas.selected_nodes && canvas.selected_nodes[node.id]) {
-                            nodes = Object.values(canvas.selected_nodes);
-                        } else {
-                            nodes = [node];
-                        }
-                        nodes = nodes.filter(n => n.type !== "RuiTitle");
-                        if (!nodes.length) return [];
-                        
-                        let shortcutText = "";
-                        try {
-                            const stored = localStorage.getItem("rui_theme_shortcut");
-                            if (stored) {
-                                const sc = JSON.parse(stored);
-                                const parts = [];
-                                if (sc.ctrl) parts.push("Ctrl");
-                                if (sc.alt) parts.push("Alt");
-                                if (sc.shift) parts.push("Shift");
-                                parts.push(sc.key.toUpperCase());
-                                shortcutText = ` <span style="color:#888;font-size:10px;">${ruiT('快捷键','Shortcut')}${parts.join("+")}</span>`;
-                            }
-                        } catch (e) {}
-                        return [
-                            null,
-                            {
-                                content: nodes.length > 1
-                                    ? `<span style="color:#FFD700;">🎨 ${ruiT('Rui主题','Rui Theme')} (${nodes.length})${shortcutText}</span>`
-                                    : `<span style="color:#FFD700;">🎨 ${ruiT('Rui主题','Rui Theme')}${shortcutText}</span>`,
-                                callback: () => {
-                                    if (window.RUIThemeManager) {
-                                        window.RUIThemeManager.currentNodes = nodes;
-                                        window.RUIThemeManager.showPanelForNodes(nodes);
-                                    }
-                                }
-                            }
-                        ];
-                    }
-                });
-            } catch(e) {}
+app.registerExtension({
+    name: "RUI.Theme",
+
+    beforeRegisterNodeDef(nodeType) {
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function(info) {
+            const result = onConfigure?.apply(this, arguments);
+            const theme = info?._ruiGradient || this._ruiGradient;
+            if (theme && !this.properties.rui_theme) {
+                this.properties.rui_theme = JSON.parse(JSON.stringify(theme));
+            }
+            delete this._ruiGradient;
+            window.RUIThemeManager?.scheduleDOMGradients();
+            return result;
+        };
+    },
+
+    nodeCreated() {
+        window.RUIThemeManager?.scheduleDOMGradients();
+    },
+
+    afterConfigureGraph() {
+        window.RUIThemeManager?.scheduleDOMGradients();
+    },
+
+    getNodeMenuItems(node) {
+        if (!window.RUIThemeManager) return [];
+
+        const canvas = app.canvas;
+        let nodes = [];
+        if (canvas.selected_nodes && canvas.selected_nodes[node.id]) {
+            nodes = Object.values(canvas.selected_nodes);
         } else {
-            setTimeout(tryRegister, 100);
+            nodes = [node];
         }
+        nodes = nodes.filter(n => n.type !== "RuiTitle");
+        if (!nodes.length) return [];
+
+        let shortcutText = "";
+        try {
+            const stored = localStorage.getItem("rui_theme_shortcut");
+            if (stored) {
+                const sc = JSON.parse(stored);
+                const parts = [];
+                if (sc.ctrl) parts.push("Ctrl");
+                if (sc.alt) parts.push("Alt");
+                if (sc.shift) parts.push("Shift");
+                parts.push(sc.key.toUpperCase());
+                shortcutText = ` <span style="color:#888;font-size:10px;">${ruiT('快捷键','Shortcut')}${parts.join("+")}</span>`;
+            }
+        } catch (e) {}
+        return [
+            null,
+            {
+                content: nodes.length > 1
+                    ? `<span style="color:#FFD700;">🎨 ${ruiT('Rui主题','Rui Theme')} (${nodes.length})${shortcutText}</span>`
+                    : `<span style="color:#FFD700;">🎨 ${ruiT('Rui主题','Rui Theme')}${shortcutText}</span>`,
+                callback: () => {
+                    if (window.RUIThemeManager) {
+                        window.RUIThemeManager.currentNodes = nodes;
+                        window.RUIThemeManager.showPanelForNodes(nodes);
+                    }
+                }
+            }
+        ];
     }
-    tryRegister();
-})();
+});

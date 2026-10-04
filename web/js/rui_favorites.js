@@ -66,6 +66,7 @@ class Rui {
                     if (w.useCount === undefined) w.useCount = 0;
                     if (w.lastUsed === undefined) w.lastUsed = 0;
                     if (w.addedAt === undefined) w.addedAt = Date.now() + i;
+                    if (w.order === undefined) w.order = w.addedAt;
                 });
                 if (!parsed.useColors || !Array.isArray(parsed.useColors) || parsed.useColors.length === 0) {
                     parsed.useColors = DEFAULT_USE_COLORS.map(x => ({ ...x }));
@@ -420,10 +421,6 @@ class Rui {
             node.pos = [canvasX, canvasY];
             app.graph.add(node);
             canvas.setDirty(true, true);
-
-            if (node.onAdded) {
-                node.onAdded();
-            }
 
             app.graph.change();
         } catch (e) {
@@ -1712,6 +1709,7 @@ class Rui {
                                     <button class="nf-clear-invalid-btn" id="nf-clear-invalid-btn" style="display:none;" title="${ruiT('清理所有失效节点','Clear all invalid nodes')}">🧹 ${ruiT('清理失效','Clear invalid')}</button>
                                 </div>
                                 <div class="nf-sort-btns">
+                                    <button class="nf-sort-btn" id="nf-sort-manual" title="${ruiT('手动排序（Shift + 拖动调整顺序）','Manual order (Shift + drag to reorder)')}">↕</button>
                                     <button class="nf-sort-btn active" id="nf-sort-default" title="${ruiT('按使用频率排序','Sort by usage frequency')}">🔥</button>
                                     <button class="nf-sort-btn" id="nf-sort-time" title="${ruiT('按最近使用排序','Sort by recent use')}">🕐</button>
                                 </div>
@@ -1826,6 +1824,8 @@ class Rui {
             settingsBtn.addEventListener("click", () => this.showSettingsDialog());
         }
 
+        const sortManualBtn = this.panel.querySelector("#nf-sort-manual");
+        sortManualBtn?.addEventListener("click", () => this.setSortMode("manual"));
         const sortDefaultBtn = this.panel.querySelector("#nf-sort-default");
         const sortTimeBtn = this.panel.querySelector("#nf-sort-time");
         if (sortDefaultBtn) {
@@ -2929,36 +2929,11 @@ class Rui {
             }
             const nodeIds = new Set(selectedNodes.map(n => n.id));
 
-            // 序列化节点数据（安全深拷贝，避免循环引用或非序列化对象）
-            const safeClone = (obj) => {
-                try {
-                    return JSON.parse(JSON.stringify(obj));
-                } catch (e) {
-                    return null;
-                }
-            };
-
-            const nodesData = selectedNodes.map(n => {
-                const ser = {};
-                ser.id = n.id;
-                ser.type = n.type;
-                ser.pos = n.pos ? [...n.pos] : [0, 0];
-                ser.size = n.size ? [...n.size] : [200, 80];
-                ser.flags = n.flags ? { ...n.flags } : {};
-                ser.order = n.order || 0;
-                ser.mode = n.mode != null ? n.mode : 0;
-                ser.properties = n.properties ? safeClone(n.properties) || {} : {};
-                ser.widgets_values = n.widgets_values ? safeClone(n.widgets_values) || [] : [];
-                // 保存 inputs/outputs 结构用于恢复连线
-                ser.inputs = n.inputs ? n.inputs.map(inp => ({
-                    name: inp.name,
-                    type: inp.type
-                })) : [];
-                ser.outputs = n.outputs ? n.outputs.map(out => ({
-                    name: out.name,
-                    type: out.type
-                })) : [];
-                return ser;
+            const nodesData = selectedNodes.map(node => {
+                const data = JSON.parse(JSON.stringify(node.serialize()));
+                for (const input of data.inputs || []) input.link = null;
+                for (const output of data.outputs || []) output.links = [];
+                return data;
             });
 
             // 提取选中节点之间的连线
@@ -3063,6 +3038,7 @@ class Rui {
                     linksData: data.linksData,
                     _typeSignature: data.typeSignature,
                     addedAt: Date.now(),
+                    order: self.favorites.workflows.reduce((max, item) => Math.max(max, item.order || item.addedAt || 0), 0) + 1000,
                     useCount: 0,
                     lastUsed: Date.now()
                 });
@@ -3102,7 +3078,10 @@ class Rui {
         this.saveFavorites();
         this.renderFavorites();
         this.renderCategories();
-        this._deletePreviewImage("wf_" + id);
+        const previewKey = "wf_" + id;
+        this._previewCanvasCache.delete(previewKey);
+        this._previewEl?.removeAttribute("data-current-type");
+        this._deletePreviewImage(previewKey);
     }
 
     addWorkflowToCanvas(workflow, targetX = null, targetY = null) {
@@ -3113,8 +3092,6 @@ class Rui {
                 console.error("[Rui] 画布不可用");
                 return;
             }
-
-            console.log("[Rui] 恢复工作流:", workflow.name, "节点数:", workflow.nodesData?.length);
 
             // 计算放置中心
             let cx, cy;
@@ -3165,7 +3142,6 @@ class Rui {
             const originCy = (minY + maxY) / 2;
 
             // 创建节点
-            const idMap = {};
             const nodeMap = {};
             for (const nd of workflow.nodesData) {
                 const node = LiteGraph.createNode(nd.type);
@@ -3174,52 +3150,24 @@ class Rui {
                     continue;
                 }
 
-                // 分配新ID
-                let newId;
-                if (graph.getNextNodeId) {
-                    newId = graph.getNextNodeId();
-                } else {
-                    newId = graph._nodeIdCounter || 1;
-                    graph._nodeIdCounter = newId + 1;
-                }
-                idMap[nd.id] = newId;
-                nodeMap[nd.id] = node;
-                node.id = newId;
-
-                // 设置位置（相对偏移）
-                node.pos = [cx + (nd.pos[0] - originCx), cy + (nd.pos[1] - originCy)];
-
-                // 恢复节点状态
-                if (nd.size) node.size = [...nd.size];
-                if (nd.flags) Object.assign(node.flags, nd.flags);
-                if (nd.mode !== undefined) node.mode = nd.mode;
-                if (nd.properties) node.properties = JSON.parse(JSON.stringify(nd.properties));
-                if (nd.widgets_values) node.widgets_values = JSON.parse(JSON.stringify(nd.widgets_values));
-
-                // 添加到画布
                 graph.add(node);
-                if (typeof node.onAdded === 'function') node.onAdded();
-
-                // 恢复 widget 值
-                if (node.widgets && node.widgets_values) {
-                    for (let i = 0; i < node.widgets.length && i < node.widgets_values.length; i++) {
-                        if (node.widgets[i]) {
-                            node.widgets[i].value = node.widgets_values[i];
-                        }
-                    }
-                }
+                nodeMap[nd.id] = node;
+                const data = JSON.parse(JSON.stringify(nd));
+                data.id = node.id;
+                data.pos = [cx + (nd.pos[0] - originCx), cy + (nd.pos[1] - originCy)];
+                for (const input of data.inputs || []) input.link = null;
+                for (const output of data.outputs || []) output.links = [];
+                node.configure(data);
             }
 
             // 恢复连线
-            let linkCount = 0;
             for (const ld of workflow.linksData) {
                 const srcNode = nodeMap[ld.origin_id];
                 const tgtNode = nodeMap[ld.target_id];
                 if (!srcNode || !tgtNode) continue;
 
                 try {
-                    const result = srcNode.connect(ld.origin_slot, tgtNode, ld.target_slot);
-                    if (result != null && result !== -1) linkCount++;
+                    srcNode.connect(ld.origin_slot, tgtNode, ld.target_slot);
                 } catch (e) {
                     console.warn("[Rui] 连线恢复失败:", e);
                 }
@@ -3237,8 +3185,6 @@ class Rui {
                 this.saveFavorites();
                 this.renderFavorites();
             }
-
-            console.log(`[Rui] 工作流恢复完成: ${workflow.name} (${Object.keys(idMap).length}节点, ${linkCount}连线)`);
         } catch (e) {
             console.error("[Rui] 恢复工作流失败:", e);
             console.error(e.stack);
@@ -3319,6 +3265,8 @@ class Rui {
                     this.showRenameWorkflowDialog(wfId);
                 } else if (el.dataset.action === "move") {
                     this.showMoveWorkflowCategoryDialog(wfId);
+                } else if (el.dataset.action === "refresh-preview") {
+                    this.refreshWorkflowPreview(wfId);
                 } else if (el.dataset.action === "clear") {
                     if (useCount > 0 && confirm(ruiT('确定清空工作流','Clear workflow ') + `"${wfName}"` + ruiT('的使用频率记录吗？',' usage frequency records?'))){
                         if (wf) { wf.useCount = 0; this.saveFavorites(); this.renderFavorites(); }
@@ -3520,7 +3468,7 @@ class Rui {
     }
 
     getFilteredFavorites() {
-        let nodes = this.favorites.nodes;
+        let nodes = [...this.favorites.nodes];
 
         if (this.currentCategory !== "all") {
             nodes = nodes.filter(n => n.categoryId === this.currentCategory);
@@ -3537,7 +3485,9 @@ class Rui {
         }
 
         const sortMode = this.favorites.sortMode || "default";
-        if (sortMode === "time") {
+        if (sortMode === "manual") {
+            return nodes.sort((a, b) => (a.order || 0) - (b.order || 0));
+        } else if (sortMode === "time") {
             return nodes.sort((a, b) => {
                 return (b.lastUsed || 0) - (a.lastUsed || 0);
             });
@@ -3550,7 +3500,7 @@ class Rui {
     }
 
     getFilteredWorkflows() {
-        let workflows = this.favorites.workflows || [];
+        let workflows = [...(this.favorites.workflows || [])];
         if (this.currentCategory !== "all") {
             workflows = workflows.filter(w => w.categoryId === this.currentCategory);
         }
@@ -3560,6 +3510,13 @@ class Rui {
                 this.fuzzyMatch(this.toPinyinInitials(w.name), this.currentSearch) ||
                 this.fuzzyMatch(this.toPinyinFull(w.name), this.currentSearch)
             );
+        }
+        const mode = this.favorites.sortMode || "default";
+        if (mode === "manual") {
+            return workflows.sort((a, b) => (a.order || a.addedAt || 0) - (b.order || b.addedAt || 0));
+        }
+        if (mode === "time") {
+            return workflows.sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
         }
         return workflows.sort((a, b) => {
             if ((b.useCount || 0) !== (a.useCount || 0)) return (b.useCount || 0) - (a.useCount || 0);
@@ -3579,13 +3536,10 @@ class Rui {
     }
 
     updateSortButtons() {
-        const defaultBtn = this.panel?.querySelector("#nf-sort-default");
-        const timeBtn = this.panel?.querySelector("#nf-sort-time");
-        if (!defaultBtn || !timeBtn) return;
-
         const mode = this.favorites.sortMode || "default";
-        defaultBtn.classList.toggle("active", mode === "default");
-        timeBtn.classList.toggle("active", mode === "time");
+        for (const name of ["manual", "default", "time"]) {
+            this.panel?.querySelector(`#nf-sort-${name}`)?.classList.toggle("active", mode === name);
+        }
     }
 
     updateClearButtonVisibility() {
@@ -3978,7 +3932,7 @@ class Rui {
                         self.searchInput.blur();
                     }
                     if (isReorderDrag) {
-                        self.startReorderDrag(item, e.clientY);
+                        self.startReorderDrag(item);
                     } else if (isWorkflowDrag) {
                         self.draggingWorkflowId = dragInfo.id;
                         self.updateDragPreview(e.clientX, e.clientY, "🔗 " + dragInfo.name);
@@ -4026,7 +3980,7 @@ class Rui {
                 startY = e.clientY;
                 isDrag = false;
                 isWorkflowDrag = kind === "workflow";
-                isReorderDrag = false;
+                isReorderDrag = self.favorites.sortMode === "manual" && e.shiftKey;
 
                 if (kind === "workflow") {
                     const wfId = item.dataset.wfId;
@@ -4241,6 +4195,27 @@ class Rui {
         const dataUrl = await this._captureNodeImage(node) || this._createPreviewPlaceholder(nodeName || node.title || nodeType);
         await this._savePreviewImage(nodeType, dataUrl);
         this._previewCanvasCache.delete(nodeType);
+        this._previewEl?.removeAttribute("data-current-type");
+    }
+
+    async refreshWorkflowPreview(wfId) {
+        const workflow = this.favorites.workflows.find(item => item.id === wfId);
+        if (!workflow) return;
+        const nodes = Object.values(app.canvas?.selected_nodes || {});
+        const signature = nodes.map(node => node.type).sort().join(",");
+        const expected = workflow._typeSignature || workflow.nodesData.map(node => node.type).sort().join(",");
+        if (!nodes.length || signature !== expected) {
+            alert(ruiT('请选中这组节点后再刷新缩略图。', 'Select this node combination before refreshing its thumbnail.'));
+            return;
+        }
+        const dataUrl = await this._captureWorkflowImage(nodes);
+        if (!dataUrl) {
+            alert(ruiT('请让选中的节点完整显示在画布中，再刷新缩略图。', 'Show all selected nodes on the canvas before refreshing the thumbnail.'));
+            return;
+        }
+        const previewKey = "wf_" + wfId;
+        await this._savePreviewImage(previewKey, dataUrl);
+        this._previewCanvasCache.delete(previewKey);
         this._previewEl?.removeAttribute("data-current-type");
     }
 
@@ -4935,25 +4910,10 @@ class Rui {
         }, delay);
     }
 
-    moveFavorite(nodeType, offset) {
-        const nodes = this.getFilteredFavorites();
-        const idx = nodes.findIndex(n => n.type === nodeType);
-        if (idx < 0) return;
-        const newIdx = idx + offset;
-        if (newIdx < 0 || newIdx >= nodes.length) return;
-        const moved = nodes.splice(idx, 1)[0];
-        nodes.splice(newIdx, 0, moved);
-        nodes.forEach((n, i) => n.order = i);
-        this.saveFavorites();
-        this.renderFavorites();
-    }
-
-    startReorderDrag(item, clientY) {
+    startReorderDrag(item) {
         this._reorderData = {
             item: item,
-            nodeType: item.dataset.type,
-            startY: clientY,
-            originalIndex: Array.from(this.favoritesList.children).indexOf(item)
+            kind: item.dataset.kind
         };
         item.classList.add("nf-reorder-dragging");
         document.addEventListener("mousemove", this._onReorderMove = (e) => this.onReorderMove(e));
@@ -4963,7 +4923,8 @@ class Rui {
     onReorderMove(e) {
         if (!this._reorderData || !this.favoritesList) return;
 
-        const items = Array.from(this.favoritesList.querySelectorAll(".nf-fav-item:not(.nf-reorder-dragging)"));
+        const kind = this._reorderData.kind;
+        const items = Array.from(this.favoritesList.querySelectorAll(`.nf-fav-item[data-kind="${kind}"]:not(.nf-reorder-dragging)`));
         const draggingItem = this._reorderData.item;
         const mouseY = e.clientY;
 
@@ -4976,57 +4937,25 @@ class Rui {
                 return;
             }
         }
-        this.favoritesList.appendChild(draggingItem);
+        if (items.length) this.favoritesList.insertBefore(draggingItem, items[items.length - 1].nextSibling);
     }
 
     endReorderDrag() {
         if (!this._reorderData) return;
 
-        const item = this._reorderData.item;
-        const nodeType = this._reorderData.nodeType;
+        const { item, kind } = this._reorderData;
         item.classList.remove("nf-reorder-dragging");
-
-        const items = Array.from(this.favoritesList.querySelectorAll(".nf-fav-item"));
-        const newIndex = items.indexOf(item);
-
-        const categoryId = this.currentCategory === "all" ? null : this.currentCategory;
-        let catNodes = this.favorites.nodes;
-        if (categoryId) {
-            catNodes = catNodes.filter(n => n.categoryId === categoryId);
-        }
-
-        const sortMode = this.favorites.sortMode || "default";
-        if (sortMode === "default") {
-            catNodes.sort((a, b) => (a.order || 0) - (b.order || 0));
-        } else {
-            catNodes.sort((a, b) => {
-                if ((b.lastUsed || 0) !== (a.lastUsed || 0)) return (b.lastUsed || 0) - (a.lastUsed || 0);
-                return (a.order || 0) - (b.order || 0);
-            });
-        }
-
-        const draggedNode = this.favorites.nodes.find(n => n.type === nodeType);
-        if (!draggedNode) {
-            this._reorderData = null;
-            return;
-        }
-
-        if (newIndex === 0) {
-            if (items.length > 1) {
-                const nextNode = this.favorites.nodes.find(n => n.type === items[1].dataset.type);
-                draggedNode.order = (nextNode?.order || 1000) - 1000;
-            } else {
-                draggedNode.order = 1000;
-            }
-        } else if (newIndex === items.length - 1) {
-            const prevNode = this.favorites.nodes.find(n => n.type === items[items.length - 2].dataset.type);
-            draggedNode.order = (prevNode?.order || 0) + 1000;
-        } else {
-            const prevNode = this.favorites.nodes.find(n => n.type === items[newIndex - 1].dataset.type);
-            const nextNode = this.favorites.nodes.find(n => n.type === items[newIndex + 1].dataset.type);
-            const prevOrder = prevNode?.order || 0;
-            const nextOrder = nextNode?.order || (prevOrder + 2000);
-            draggedNode.order = (prevOrder + nextOrder) / 2;
+        const key = kind === "workflow" ? "id" : "type";
+        const entries = kind === "workflow" ? this.favorites.workflows : this.favorites.nodes;
+        const items = Array.from(this.favoritesList.querySelectorAll(`.nf-fav-item[data-kind="${kind}"]`));
+        const byId = new Map(entries.map(entry => [entry[key], entry]));
+        const visible = items.map(el => byId.get(kind === "workflow" ? el.dataset.wfId : el.dataset.type)).filter(Boolean);
+        const visibleIds = new Set(visible.map(entry => entry[key]));
+        let index = 0;
+        const ordered = [...entries].sort((a, b) => (a.order || a.addedAt || 0) - (b.order || b.addedAt || 0));
+        for (let i = 0; i < ordered.length; i++) {
+            const entry = visibleIds.has(ordered[i][key]) ? visible[index++] : ordered[i];
+            entry.order = (i + 1) * 1000;
         }
 
         this.saveFavorites();
@@ -5060,10 +4989,6 @@ class Rui {
 
             graph.add(node);
             canvas.setDirty(true, true);
-
-            if (node.onAdded) {
-                node.onAdded();
-            }
 
             app.graph.change();
         } catch (e) {
@@ -5136,11 +5061,9 @@ class Rui {
     }
 
     deleteCategory(catId) {
-        this.favorites.nodes.forEach(n => {
-            if (n.categoryId === catId) {
-                n.categoryId = "default";
-            }
-        });
+        for (const item of [...this.favorites.nodes, ...this.favorites.workflows]) {
+            if (item.categoryId === catId) item.categoryId = "default";
+        }
 
         this.favorites.categories = this.favorites.categories.filter(c => c.id !== catId);
 

@@ -149,6 +149,11 @@ function getButtonRects(y, W, H, settings) {
     return { rects, contentW, contentH, scale };
 }
 
+function getWidgetButtonRects(widget, node, width, y, settings) {
+    const height = widget.computedHeight ?? (node.size[1] - y);
+    return getButtonRects(y, width, Math.max(1, height - 4), settings);
+}
+
 const DEFAULT_SETTINGS = {
     labels: { "0": "", "1": "" },
     colors: { color1: "#000000", color2: "#FF0000", color3: "#000000", direction: "180deg" },
@@ -199,8 +204,7 @@ app.registerExtension({
                 draw(ctx, node, W, y, H) {
                     const settings = getNodeSettings(node, DEFAULT_SETTINGS);
                     const count = settings.count;
-                    const availableH = Math.max(1, node.size[1] - y - 4);
-                    const { rects, contentH, scale } = getButtonRects(y, W, availableH, settings);
+                    const { rects, contentH, scale } = getWidgetButtonRects(this, node, W, y, settings);
                     const currentValue = String(tagWidget.value ?? "0");
 
                     for (let i = 0; i < count; i++) {
@@ -244,10 +248,9 @@ app.registerExtension({
                     if (event.button !== 0 && event.type === "mousedown") return false;
 
                     const settings = getNodeSettings(node, DEFAULT_SETTINGS);
-                    const W = node.size[0];
-                    const y = this.y || 0;
-                    const availableH = Math.max(1, node.size[1] - y - 4);
-                    const { rects } = getButtonRects(y, W, availableH, settings);
+                    const W = this.width || node.size[0];
+                    const y = this.last_y ?? this.y ?? 0;
+                    const { rects } = getWidgetButtonRects(this, node, W, y, settings);
 
                     for (let i = 0; i < rects.length; i++) {
                         const r = rects[i];
@@ -266,11 +269,13 @@ app.registerExtension({
                     return false;
                 },
 
-                computeSize(width) {
+                computeLayoutSize() {
                     const settings = getNodeSettings(node, DEFAULT_SETTINGS);
                     const base = getBaseLayout(settings);
                     const scale = settings.scaleMode === "fixed" ? settings.contentScale : 1;
-                    return [width, base.contentH * scale + 8];
+                    // Let LiteGraph allocate the remaining height to this widget,
+                    // so enlarged buttons stay inside its mouse hit area.
+                    return { minWidth: 0, minHeight: base.contentH * scale + 12 };
                 },
             });
 
