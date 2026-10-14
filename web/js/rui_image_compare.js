@@ -45,7 +45,7 @@ class XzgImageCompareWidget {
         this.node = node;
         this.hitAreas = {};
         this.selected = [];        // [image_a_info, image_b_info]
-        this._value = { images: [] };
+        this._value = { images: [], selection: [] };
     }
 
     set value(v) {
@@ -74,13 +74,32 @@ class XzgImageCompareWidget {
             cleaned[1].selected = true;
         }
 
+        const selection = Array.isArray(v?.selection) ? v.selection : [];
         this._value.images = cleaned;
-        selected = cleaned.filter(d => d.selected);
+        selected = selection.map(name => cleaned.find(d => d.name === name)).filter(Boolean);
+        if (selected.length < 2) selected = cleaned.filter(d => d.selected);
         this._setSelected(selected);
+        if (!cleaned.length) this._value.selection = [...selection];
     }
 
     get value() {
         return this._value;
+    }
+
+    setOutput(output, restoreSelection = false) {
+        const images = [];
+        for (const [side, batch] of [["A", output.a_images || []], ["B", output.b_images || []]]) {
+            for (const [i, source] of batch.entries()) {
+                images.push({
+                    name: batch.length > 1 ? `${side}${i + 1}` : side,
+                    selected: i === 0,
+                    url: imageUrl(source),
+                    source,
+                });
+            }
+        }
+        this.value = { images, selection: restoreSelection ? this._value.selection : [] };
+        this.node.setDirtyCanvas(true, true);
     }
 
     _loadImage(data) {
@@ -88,6 +107,11 @@ class XzgImageCompareWidget {
 
         const img = new Image();
         img.onload = () => {
+            this.node.setDirtyCanvas(true, true);
+            redrawCanvas();
+        };
+        img.onerror = () => {
+            data.error = true;
             this.node.setDirtyCanvas(true, true);
             redrawCanvas();
         };
@@ -103,12 +127,12 @@ class XzgImageCompareWidget {
             sel.selected = true;
         }
         this.selected = selected;
+        this._value.selection = selected.map(d => d.name);
     }
 
     _swapAB() {
         if (this.selected.length < 2) return;
-        // 交换 selected 数组中的两个元素
-        [this.selected[0], this.selected[1]] = [this.selected[1], this.selected[0]];
+        this._setSelected([this.selected[1], this.selected[0]]);
         this.node.setDirtyCanvas(true, true);
     }
 
@@ -192,18 +216,13 @@ class XzgImageCompareWidget {
                     data: img,
                     onDown: (e, pos, node, bounds) => {
                         const clicked = bounds.data;
-                        // 直接切换选中项
-                        if (clicked.name.startsWith("A") && this.selected[0] !== clicked) {
-                            this.selected[0].selected = false;
-                            this.selected[0] = clicked;
-                            clicked.selected = true;
-                            this._loadImage(clicked);
-                        } else if (!clicked.name.startsWith("A") && this.selected[1] !== clicked) {
-                            this.selected[1].selected = false;
-                            this.selected[1] = clicked;
-                            clicked.selected = true;
-                            this._loadImage(clicked);
-                        }
+                        if (this.selected.includes(clicked)) return;
+                        const side = clicked.name[0];
+                        const index = this.selected.findIndex(d => d.name[0] === side);
+                        if (index < 0) return;
+                        const selected = [...this.selected];
+                        selected[index] = clicked;
+                        this._setSelected(selected);
                         node.setDirtyCanvas(true, true);
                     }
                 };
@@ -220,10 +239,19 @@ class XzgImageCompareWidget {
         const imgA = this.selected[0];
         const imgB = this.selected[1];
         if (!imgA || !imgB) return;
-        if (!imgA.img || !imgA.img.naturalWidth || !imgB.img || !imgB.img.naturalWidth) return;
 
         const nodeHeight = node.size[1] - y - IMAGE_MARGIN;
         if (nodeHeight <= 0) return;
+        if (imgA.error || imgB.error) {
+            ctx.fillStyle = "#aaaaaa";
+            ctx.font = "12px Arial";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(ruiT("预览加载失败，请重新运行", "Preview unavailable. Run the workflow again."),
+                width / 2, y + nodeHeight / 2, width - IMAGE_MARGIN * 2);
+            return;
+        }
+        if (!imgA.img || !imgA.img.naturalWidth || !imgB.img || !imgB.img.naturalWidth) return;
 
         // 实时从节点 widgets 读取划线参数
         const lineWidget = node.widgets?.find(w => w.name === "show_line");
@@ -306,8 +334,8 @@ class XzgImageCompareWidget {
     }
 
     serializeValue(node, index) {
-        // 不持久化图片，刷新后自动消失
-        return { images: [] };
+        // 图片由 ComfyUI 的工作流结果缓存恢复，仅保存选择和交换方向。
+        return { images: [], selection: [...this._value.selection] };
     }
 
     mouse(event, pos, node) {
@@ -339,46 +367,13 @@ class RuiImageCompareNode {
     }
 
     onExecuted(output) {
-        const aImages = output.a_images || [];
-        const bImages = output.b_images || [];
-
         // 从节点 widgets 中读取划线参数
         const lineWidget = this.widgets?.find(w => w.name === "show_line");
         if (lineWidget !== undefined && lineWidget !== null) {
             this.showLine = lineWidget.value;
         }
 
-        const imagesToShow = [];
-        for (const [i, d] of aImages.entries()) {
-            imagesToShow.push({
-                name: aImages.length > 1 ? `A${i + 1}` : "A",
-                selected: i === 0,
-                url: imageUrl(d),
-                source: d,
-            });
-        }
-        for (const [i, d] of bImages.entries()) {
-            imagesToShow.push({
-                name: bImages.length > 1 ? `B${i + 1}` : "B",
-                selected: i === 0,
-                url: imageUrl(d),
-                source: d,
-            });
-        }
-
-        this.canvasWidget.value = { images: imagesToShow };
-
-        this.setDirtyCanvas(true, true);
-    }
-
-    onSerialize(serialised) {
-        if (this.canvasWidget) {
-            for (let [index, wv] of (serialised.widgets_values || []).entries()) {
-                if (this.widgets[index] && this.widgets[index].name === "rui_image_compare") {
-                    serialised.widgets_values[index] = [];
-                }
-            }
-        }
+        this.canvasWidget.setOutput(output);
     }
 
     onNodeCreated() {
@@ -437,6 +432,16 @@ class RuiImageCompareNode {
 // ============ 注册扩展 ============
 app.registerExtension({
     name: "rui.ImageCompare",
+    onNodeOutputsUpdated(outputs) {
+        const rootGraph = app.rootGraph;
+        for (const graph of [rootGraph, ...rootGraph.subgraphs.values()]) {
+            for (const node of graph._nodes) {
+                if (node.type !== RUI_IMAGE_COMPARE_TYPE) continue;
+                const id = graph === rootGraph ? String(node.id) : `${graph.id}:${node.id}`;
+                node.canvasWidget.setOutput(outputs[id] || {}, true);
+            }
+        }
+    },
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === RUI_IMAGE_COMPARE_TYPE) {
             // 禁止默认的 PreviewImage 预览行为（小窗口 + X 按钮）
@@ -444,14 +449,6 @@ app.registerExtension({
             nodeType.prototype.onPreviewRegistered = function() {};
 
             // 用自定义类替换默认节点行为
-            const origOnNodeCreated = nodeType.prototype.onNodeCreated;
-            const origOnExecuted = nodeType.prototype.onExecuted;
-            const origOnDrawForeground = nodeType.prototype.onDrawForeground;
-            const origOnMouseEnter = nodeType.prototype.onMouseEnter;
-            const origOnMouseLeave = nodeType.prototype.onMouseLeave;
-            const origOnMouseMove = nodeType.prototype.onMouseMove;
-            const origOnSerialize = nodeType.prototype.onSerialize;
-            const origGetHelp = nodeType.prototype.getHelp;
             const origGetExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
 
             const proto = RuiImageCompareNode.prototype;
@@ -504,10 +501,6 @@ app.registerExtension({
 
             nodeType.prototype.onMouseMove = function (event, pos, canvas) {
                 proto.onMouseMove.call(this, event, pos, canvas);
-            };
-
-            nodeType.prototype.onSerialize = function (o) {
-                proto.onSerialize.call(this, o);
             };
 
             nodeType.prototype.getHelp = function () {

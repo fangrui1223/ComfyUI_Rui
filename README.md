@@ -78,6 +78,8 @@ Qwen 编码节点只使用每个参考输入的第一张图，因此多张原图
 - `Rui Image Compare`：拖动分隔位置对比 A/B；批次图像使用滚轮切换 A，按住 Shift 使用
   滚轮切换 B。
 
+图像对比在切回工作流标签时恢复执行结果、批次选择和 A/B 交换方向。临时预览文件失效时需重新运行；刷新浏览器后的恢复不包含在此功能内。
+
 主题随工作流保存，切换工作流或重新打开后恢复。组合收藏保留节点参数、标题、主题和内部连线；旧收藏中已经丢失的数据需要重新收藏。
 
 收藏面板的 `↕` 按钮启用手动排序，按住 Shift 拖动收藏项调整顺序。节点与组合分别排序，使用频率和最近使用排序仍可选。刷新组合缩略图前，请选中对应节点并让它们完整显示在画布中。
@@ -91,6 +93,7 @@ Python 节点只会在 ComfyUI 启动时注册。更新本插件后需要重启 
 
 ```powershell
 C:\FR_comfyui_next\ComfyUI\.venv\Scripts\python.exe -m unittest discover -s tests -v
+node --test tests\test_image_compare_frontend.cjs
 ```
 
 源码级迁移边界与验收项见 `docs/SOURCE_EQUIVALENCE_BLUEPRINT.md` 和
