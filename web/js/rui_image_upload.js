@@ -445,8 +445,6 @@ function createImgBatchUI(node) {
     let _altDragActive = false;            // Alt+左右拖动调整笔刷大小
     let _altDragStartX = 0;                // Alt+拖动起始 X 坐标
     let _altDragStartBrush = 0;            // Alt+拖动起始笔刷大小
-    let _maskOrigSize = null;               // 记录遮罩开启前的节点原始大小
-    let _maskOrigCanvas = null;              // 记录遮罩开启前的画布状态 { scale, offset }
     let _maskImgZoom = 1;                    // 图片缩放倍率（1x~8x）
     let _maskTx = 0;                         // 当前 CSS translateX（增量累积）
     let _maskTy = 0;                         // 当前 CSS translateY（增量累积）
@@ -767,44 +765,10 @@ function createImgBatchUI(node) {
             return;
         }
         maskEnabled = !maskEnabled;
-        // 开启遮罩时自动选中节点、调整大小、放大画布
-        if (maskEnabled && app?.canvas) {
-            app.canvas.selectNode(node);
-            if (!_maskOrigSize) {
-                _maskOrigSize = [node.size[0], node.size[1]];
-            }
-            if (!_maskOrigCanvas) {
-                _maskOrigCanvas = {
-                    scale: app.canvas.ds.scale,
-                    offset: [app.canvas.ds.offset[0], app.canvas.ds.offset[1]],
-                };
-            }
-            node.setSize([1280, 720]);
-            // canvas.width/height 是设备像素，高 DPI 下会把节点错误放大。
-            // 遮罩编辑按浏览器中的实际可视区域缩放，并留出工具栏边距。
-            const canvasRect = app.canvas.canvas.getBoundingClientRect();
-            const cw = app.canvas.canvas.clientWidth || canvasRect.width;
-            const ch = app.canvas.canvas.clientHeight || canvasRect.height;
-        const scale = Math.min((cw * 0.90) / 1280, (ch * 0.82) / 750);
-            const nodeCenterX = node.pos[0] + 640;
-        const nodeCenterY = node.pos[1] + 345;
-            app.canvas.ds.scale = scale;
-            app.canvas.ds.offset[0] = cw / (2 * scale) - nodeCenterX;
-            app.canvas.ds.offset[1] = ch / (2 * scale) - nodeCenterY;
-            app.canvas.setDirty(true, true);
-        }
-        // 关闭遮罩时恢复原始大小和画布状态
-        if (!maskEnabled && _maskOrigSize) {
-            node.setSize(_maskOrigSize);
-            _maskOrigSize = null;
+        if (maskEnabled) {
+            app.canvas?.selectNode(node);
+        } else {
             _resetImgZoom();
-            if (_maskOrigCanvas && app?.canvas) {
-                app.canvas.ds.scale = _maskOrigCanvas.scale;
-                app.canvas.ds.offset[0] = _maskOrigCanvas.offset[0];
-                app.canvas.ds.offset[1] = _maskOrigCanvas.offset[1];
-                _maskOrigCanvas = null;
-            }
-            app.canvas.setDirty(true, true);
         }
         // 开启时初始化一次离屏 canvas 尺寸
         if (maskEnabled && singleImgEl.complete && singleImgEl.naturalWidth > 0) {

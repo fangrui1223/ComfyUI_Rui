@@ -801,7 +801,8 @@ class RuiUniversalImageSaver:
             },
         }
 
-    RETURN_TYPES = ()
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
     FUNCTION = "save_images"
     OUTPUT_NODE = True
     CATEGORY = "Rui/Image/Save"
@@ -866,17 +867,14 @@ class RuiUniversalImageSaver:
     def save_images(self, images, save_dir, folder_name, save_name, save_format="jpg", quality=95, copy_to_comfy_output=True):
         # 1. 基础校验
         if images is None:
-            print("[RuiUniversalSaver] 错误：未接收到图像输入 images")
-            return {"ui": {"images": []}}
+            raise ValueError("Rui 通用图像保存器未接收到图像。")
 
         if not save_dir or not str(save_dir).strip():
-            print("[RuiUniversalSaver] 错误：未填写保存路径 save_dir")
-            return {"ui": {"images": []}}
+            raise ValueError("Rui 通用图像保存器的保存根目录不能为空。")
 
         target_dir = self._build_target_dir(save_dir, folder_name)
         if not target_dir:
-            print("[RuiUniversalSaver] 错误：目标保存路径无效")
-            return {"ui": {"images": []}}
+            raise ValueError("Rui 通用图像保存器的目标保存目录无效。")
 
         clean_base_name = (save_name or "").strip()
         if not clean_base_name:
@@ -948,7 +946,7 @@ class RuiUniversalImageSaver:
             if output_info is not None:
                 results.append(output_info)
 
-        return {"ui": {"images": results}}
+        return {"ui": {"images": results}, "result": (images,)}
 
 class RuiPlaySound:
     """
